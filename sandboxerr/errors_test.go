@@ -4,12 +4,23 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/gitproduct/docker-sandbox/sandboxerr"
 )
+
+func TestClassify_LocalMissingFileIsNotDockerUnavailable(t *testing.T) {
+	if got := sandboxerr.Classify(os.ErrNotExist); got == sandboxerr.KindUnavailable {
+		t.Fatalf("Classify(os.ErrNotExist)=%s want non-unavailable", got)
+	}
+	pathErr := &os.PathError{Op: "open", Path: "/tmp/missing", Err: os.ErrNotExist}
+	if got := sandboxerr.Classify(pathErr); got == sandboxerr.KindUnavailable {
+		t.Fatalf("Classify(PathError)=%s want non-unavailable", got)
+	}
+}
 
 func TestWrap_NilReturnsNil(t *testing.T) {
 	if err := sandboxerr.Wrap("ping", nil); err != nil {

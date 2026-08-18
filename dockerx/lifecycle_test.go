@@ -253,3 +253,39 @@ func TestCreateContainer_PullSingleflight(t *testing.T) {
 		t.Fatalf("pull count = %d, want 1 (singleflight); ops=%v", got, fake.ops)
 	}
 }
+
+func TestCreateContainer_PullWaiterHonorsOwnCancellation(t *testing.T) {
+	hold := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	fake := &fakeEngine{
+		imageMissing: true,
+		pullHold:     hold,
+		pullEntered:  entered,
+	}
+	c := dockerx.NewWithAPI(fake)
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := c.CreateContainer(context.Background(), dockerx.CreateOptions{Image: "alpine:3.20", Name: "leader"})
+		leaderDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for leader pull")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	_, err := c.CreateContainer(ctx, dockerx.CreateOptions{Image: "alpine:3.20", Name: "waiter"})
+	if !sandboxerr.IsCanceled(err) {
+		t.Fatalf("waiter err=%v want canceled", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("canceled waiter blocked for %v", elapsed)
+	}
+	close(hold)
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader: %v", err)
+	}
+}

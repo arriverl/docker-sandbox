@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"syscall"
 )
@@ -154,8 +153,7 @@ func isUnavailable(err error) bool {
 	if errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, io.EOF) ||
-		errors.Is(err, os.ErrNotExist) {
+		errors.Is(err, io.EOF) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
@@ -163,8 +161,6 @@ func isUnavailable(err error) bool {
 		"cannot connect to the docker daemon",
 		"connection refused",
 		"connectex",
-		"no such file or directory",
-		"the system cannot find the file",
 		"no connection could be made",
 		"actively refused",
 		"error during connect",

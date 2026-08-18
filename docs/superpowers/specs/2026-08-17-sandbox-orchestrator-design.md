@@ -241,3 +241,20 @@ wait    INSTANCE [-http PATH] [-tcp] [-exec CMD]
 - Go 1.24.2 + toolchain go1.24.2
 - Windows 上 Docker Desktop 走 npipe；本地连接不走 HTTP 代理
 - 不引入与现有 docker SDK 无关的新运行时依赖（端口文件锁使用标准库 / 已有 `golang.org/x/sys`）
+
+## 2026-08-18 生产级可靠性加固
+
+面向在线实训、代码沙箱与隔离执行环境，单机编排内核增加以下约束：
+
+- 同一进程内，相同 `instance_id` 的生命周期变更必须串行执行。
+- provision 中途失败时，只补偿本次新建的资源，不删除调用前已存在的 workspace。
+- 取消或超时不能取消补偿本身；补偿使用独立且有限的清理 context。
+- Destroy 继续尝试互相独立的清理阶段，并通过错误链返回所有失败。
+- reset Restore 必须先删除旧容器，再删除 workspace。
+- WaitReady 在轮询前拒绝永久无效的探针配置。
+- Docker label 中的紧凑 spec 上限为 4096 字节，超限必须在创建资源前失败。
+- 平台可配置默认 CPU/内存配额，并通过 `Observer` 接收 provision 阶段事件。
+- 端口绑定冲突允许一次换端口重试；镜像拉取 singleflight 等待者可独立取消。
+- CI 必须由 Windows 任务执行 gofmt、vet、单测和覆盖率，并由 Ubuntu 任务执行 race detector；live Docker smoke 独立运行。
+
+容量基线：设计峰值 300 实例、日常活跃 200 实例；端口池 70% 告警（`portpool.warn`）、85% 内核拒绝新增多端口实例（`ErrMultiPortRestricted` / `portpool.restrict`）。单端口实例不受 85% 限制，直到池耗尽。

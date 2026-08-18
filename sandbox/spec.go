@@ -2,9 +2,15 @@ package sandbox
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/gitproduct/docker-sandbox/sandboxerr"
 )
+
+// MaxEncodedSpecBytes 限制写入 Docker label 的紧凑规格大小。
+const MaxEncodedSpecBytes = 4096
 
 type compactSpec struct {
 	InstanceID string            `json:"instance_id"`
@@ -16,10 +22,17 @@ type compactSpec struct {
 	NanoCPUs   int64             `json:"nano_cpus,omitempty"`
 	Expose     []string          `json:"expose,omitempty"`
 	Labels     map[string]string `json:"labels,omitempty"`
+	SkipPull   bool              `json:"skip_pull,omitempty"`
 }
 
 // EncodeSpec 把规格编码为可写入 Docker label 的 JSON。
 func EncodeSpec(spec Spec) string {
+	raw, _ := EncodeSpecChecked(spec)
+	return raw
+}
+
+// EncodeSpecChecked 编码并验证可持久化到 Docker label 的紧凑规格。
+func EncodeSpecChecked(spec Spec) (string, error) {
 	raw, err := json.Marshal(compactSpec{
 		InstanceID: strings.TrimSpace(spec.InstanceID),
 		UserID:     strings.TrimSpace(spec.UserID),
@@ -30,11 +43,17 @@ func EncodeSpec(spec Spec) string {
 		NanoCPUs:   spec.NanoCPUs,
 		Expose:     spec.Expose,
 		Labels:     userLabels(spec.Labels),
+		SkipPull:   spec.SkipPull,
 	})
 	if err != nil {
-		return ""
+		return "", sandboxerr.WrapKind("instance.spec", sandboxerr.KindInvalid,
+			fmt.Errorf("%w: encode instance spec: %v", sandboxerr.ErrInvalid, err))
 	}
-	return string(raw)
+	if len(raw) > MaxEncodedSpecBytes {
+		return "", sandboxerr.WrapKind("instance.spec", sandboxerr.KindInvalid,
+			fmt.Errorf("%w: encoded instance spec is %d bytes, limit is %d", sandboxerr.ErrInvalid, len(raw), MaxEncodedSpecBytes))
+	}
+	return string(raw), nil
 }
 
 // DecodeSpec 从 label JSON 恢复规格。
@@ -60,6 +79,7 @@ func DecodeSpec(raw string) (Spec, bool) {
 		NanoCPUs:   c.NanoCPUs,
 		Expose:     c.Expose,
 		Labels:     c.Labels,
+		SkipPull:   c.SkipPull,
 	}, true
 }
 

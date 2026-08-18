@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Windows quality gate
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
+      DOCKER_SANDBOX_LIVE: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.2"
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Check formatting
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Filter *.go | ForEach-Object { $_.FullName }
+          $unformatted = gofmt -l $files
+          if ($unformatted) {
+            $unformatted
+            throw "Go files are not formatted"
+          }
+
+      - name: Vet
+        run: go vet -mod=mod ./...
+
+      - name: Unit tests
+        run: go test -count=1 -mod=mod ./...
+
+      - name: Coverage
+        shell: pwsh
+        run: go test -count=1 "-coverprofile=coverage.out" -mod=mod ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-coverage
+          path: coverage.out
+          if-no-files-found: error
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
+      DOCKER_SANDBOX_LIVE: "0"
+      CGO_ENABLED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.2"
+          cache: true
+
+      - name: Race tests
+        run: go test -race -count=1 -mod=mod ./...

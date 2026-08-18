@@ -42,9 +42,10 @@ type DestroyOptions struct {
 	Force        bool
 }
 
-// RestoreOptions 控制 Restore 是否保留已有卷。
+// RestoreOptions 控制 Restore 是否显式重置已有卷。
 type RestoreOptions struct {
-	KeepVolume bool
+	KeepVolume  bool
+	ResetVolume bool
 }
 
 // Workspace 管理 {prefix}-ws-{instanceId} 命名卷的创建、复用与回收。
@@ -272,7 +273,7 @@ func (w *Workspace) Restore(ctx context.Context, instanceID string, opts Restore
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if opts.KeepVolume {
+	if !opts.ResetVolume {
 		return w.ensureLocked(ctx, instanceID, name, nil)
 	}
 	if err := w.client.api.VolumeRemove(ctx, name, true); err != nil && engineKind(err) != sandboxerr.KindNotFound {

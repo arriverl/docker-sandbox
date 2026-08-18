@@ -154,6 +154,23 @@ func TestWorkspace_RestoreKeepReuses(t *testing.T) {
 	}
 }
 
+func TestWorkspace_RestoreDefaultReuses(t *testing.T) {
+	fake := &fakeEngine{}
+	ws := newWorkspace(t, fake)
+	ctx := context.Background()
+	first, err := ws.Ensure(ctx, "default-keep")
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	got, err := ws.Restore(ctx, "default-keep", dockerx.RestoreOptions{})
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if !got.Reused || got.Name != first.Name {
+		t.Fatalf("default restore = %+v", got)
+	}
+}
+
 func TestWorkspace_RestoreWithoutKeepRecreates(t *testing.T) {
 	fake := &fakeEngine{}
 	ws := newWorkspace(t, fake)
@@ -161,7 +178,7 @@ func TestWorkspace_RestoreWithoutKeepRecreates(t *testing.T) {
 	if _, err := ws.Ensure(ctx, "r2"); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	got, err := ws.Restore(ctx, "r2", dockerx.RestoreOptions{KeepVolume: false})
+	got, err := ws.Restore(ctx, "r2", dockerx.RestoreOptions{ResetVolume: true})
 	if err != nil {
 		t.Fatalf("restore reset: %v", err)
 	}

@@ -177,11 +177,13 @@ type fakeEngine struct {
 	ver                 types.Version
 	info                system.Info
 	containers          []container.Summary
+	hideCreatedFromList bool
 	images              []image.Summary
 	err                 error
 	ops                 []string
 	createID            string
 	createWarnings      []string
+	createErrOnce       error
 	lastName            string
 	lastConfig          *container.Config
 	lastHost            *container.HostConfig
@@ -225,7 +227,7 @@ func (f *fakeEngine) ContainerList(_ context.Context, opts container.ListOptions
 	if f.err != nil {
 		return nil, f.err
 	}
-	if f.lastConfig != nil && !f.gone {
+	if f.lastConfig != nil && !f.gone && !f.hideCreatedFromList {
 		id := f.createID
 		if id == "" {
 			id = "cid-1"
@@ -267,6 +269,11 @@ func (f *fakeEngine) ContainerCreate(_ context.Context, config *container.Config
 	f.lastName = name
 	f.lastConfig = config
 	f.lastHost = hostConfig
+	if f.createErrOnce != nil {
+		err := f.createErrOnce
+		f.createErrOnce = nil
+		return container.CreateResponse{}, err
+	}
 	ref := ""
 	if config != nil {
 		ref = config.Image

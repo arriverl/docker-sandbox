@@ -25,6 +25,7 @@ func TestOrchestrator_CreateRestoreByInstanceID(t *testing.T) {
 		Image:      "alpine:3.20",
 		Memory:     64 << 20,
 		NanoCPUs:   500_000_000,
+		Expose:     []string{"8080"},
 	}
 	created, err := orch.Create(ctx, spec)
 	if err != nil {
@@ -41,6 +42,13 @@ func TestOrchestrator_CreateRestoreByInstanceID(t *testing.T) {
 	}
 	if fake.lastHost.NetworkMode == "" {
 		t.Fatal("expected user network")
+	}
+	listed, err := orch.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != "box1" {
+		t.Fatalf("listed=%+v", listed)
 	}
 
 	if err := orch.Destroy(ctx, "box1", sandbox.DestroyOptions{}); err != nil {
@@ -100,6 +108,48 @@ func TestOrchestrator_CreateConflict(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "实例") {
 		t.Fatalf("want 实例 in %q", err)
+	}
+}
+
+func TestOrchestratorFallsBackToInspectWhenListLags(t *testing.T) {
+	fake := &fakeEngine{hideCreatedFromList: true}
+	orch, err := dockerx.NewOrchestrator(dockerx.NewWithAPI(fake), dockerx.UserSandboxConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := orch.Create(context.Background(), sandbox.Spec{
+		InstanceID: "box1",
+		UserID:     "alice",
+		Image:      "alpine:3.20",
+		Expose:     []string{"8080"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "box1" || got.ContainerID == "" || len(got.HostPorts) != 1 {
+		t.Fatalf("inspect fallback=%+v", got)
+	}
+}
+
+func TestNewOrchestratorAppliesConfiguredDefaultLimits(t *testing.T) {
+	fake := &fakeEngine{}
+	orch, err := dockerx.NewOrchestrator(dockerx.NewWithAPI(fake), dockerx.UserSandboxConfig{
+		DefaultMemory:   256 << 20,
+		DefaultNanoCPUs: 500_000_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = orch.Create(context.Background(), sandbox.Spec{
+		InstanceID: "box1",
+		UserID:     "alice",
+		Image:      "alpine:3.20",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.lastHost.Memory != 256<<20 || fake.lastHost.NanoCPUs != 500_000_000 {
+		t.Fatalf("limits memory=%d nanoCPUs=%d", fake.lastHost.Memory, fake.lastHost.NanoCPUs)
 	}
 }
 

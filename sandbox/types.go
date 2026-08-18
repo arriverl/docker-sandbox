@@ -1,6 +1,11 @@
 package sandbox
 
-import "time"
+import (
+	"context"
+	"time"
+
+	"github.com/gitproduct/docker-sandbox/sandboxerr"
+)
 
 const (
 	DefaultPrefix = "sandbox"
@@ -61,9 +66,12 @@ type DestroyOptions struct {
 	Purge bool
 }
 
-// RestoreOptions 控制还原是否保留 workspace 数据。
+// RestoreOptions 控制还原是否重置 workspace 数据。
 type RestoreOptions struct {
+	// KeepVolume 为兼容字段；默认和 true 都保留 workspace。
 	KeepVolume bool
+	// ResetVolume 显式删除 workspace 并创建空卷，数据不可恢复。
+	ResetVolume bool
 }
 
 // ProbeKind 是就绪探测类型。
@@ -83,8 +91,27 @@ type Probe struct {
 	Command []string // Exec 命令
 }
 
+// OperationEvent 描述一次编排阶段的完成结果，供日志、指标和审计适配器消费。
+type OperationEvent struct {
+	Operation  string
+	Stage      string
+	InstanceID string
+	UserID     string
+	Duration   time.Duration
+	Kind       sandboxerr.Kind
+	Err        error
+}
+
+// Observer 接收编排阶段事件。实现不得阻塞生命周期操作。
+type Observer interface {
+	Observe(ctx context.Context, event OperationEvent)
+}
+
 // Config 描述编排器。
 type Config struct {
-	Prefix       string
-	WaitInterval time.Duration
+	Prefix          string
+	WaitInterval    time.Duration
+	DefaultMemory   int64
+	DefaultNanoCPUs int64
+	Observer        Observer
 }

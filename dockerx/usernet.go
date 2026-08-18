@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
 
+	"github.com/gitproduct/docker-sandbox/sandbox"
 	"github.com/gitproduct/docker-sandbox/sandboxerr"
 )
 
@@ -28,16 +30,22 @@ const (
 
 // UserSandboxConfig 描述按用户隔离的网络与端口池。
 type UserSandboxConfig struct {
-	Prefix string
-	Pool   *PortPool
+	Prefix          string
+	Pool            *PortPool
+	DefaultMemory   int64
+	DefaultNanoCPUs int64
+	Observer        sandbox.Observer
 }
 
 // UserSandbox 为每个用户维护独立 Docker 网络，并用端口池分配宿主机端口。
 type UserSandbox struct {
-	client    *Client
-	pool      *PortPool
-	prefix    string
-	workspace *Workspace
+	client          *Client
+	pool            *PortPool
+	prefix          string
+	workspace       *Workspace
+	defaultMemory   int64
+	defaultNanoCPUs int64
+	observer        sandbox.Observer
 
 	mu     sync.Mutex
 	users  map[string]*userNetState
@@ -62,12 +70,15 @@ func NewUserSandbox(c *Client, cfg UserSandboxConfig) *UserSandbox {
 		})
 	}
 	s := &UserSandbox{
-		client:    c,
-		pool:      pool,
-		prefix:    prefix,
-		workspace: NewWorkspace(c, WorkspaceConfig{Prefix: prefix}),
-		users:     map[string]*userNetState{},
-		leases:    map[string][]int{},
+		client:          c,
+		pool:            pool,
+		prefix:          prefix,
+		workspace:       NewWorkspace(c, WorkspaceConfig{Prefix: prefix}),
+		defaultMemory:   cfg.DefaultMemory,
+		defaultNanoCPUs: cfg.DefaultNanoCPUs,
+		observer:        cfg.Observer,
+		users:           map[string]*userNetState{},
+		leases:          map[string][]int{},
 	}
 	_ = s.SeedPorts(context.Background())
 	return s
@@ -263,9 +274,15 @@ func (s *UserSandbox) markInactive(ctx context.Context, userID string) {
 
 // EnsureNetwork 确保用户网络存在，同用户复用同一网络。
 func (s *UserSandbox) EnsureNetwork(ctx context.Context, userID string) (string, error) {
+	name, _, err := s.EnsureNetworkTracked(ctx, userID)
+	return name, err
+}
+
+// EnsureNetworkTracked 确保用户网络存在，并报告本次调用是否创建了网络。
+func (s *UserSandbox) EnsureNetworkTracked(ctx context.Context, userID string) (string, bool, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
-		return "", sandboxerr.WrapKind("network.ensure", sandboxerr.KindInvalid,
+		return "", false, sandboxerr.WrapKind("network.ensure", sandboxerr.KindInvalid,
 			fmt.Errorf("%w: user id is empty", sandboxerr.ErrInvalid))
 	}
 	name := UserNetworkName(s.prefix, userID)
@@ -283,19 +300,20 @@ func (s *UserSandbox) EnsureNetwork(ctx context.Context, userID string) (string,
 	}
 	s.mu.Unlock()
 
-	if err := s.claimOrCreateNetwork(ctx, userID, name); err != nil {
-		return "", err
+	created, err := s.claimOrCreateNetwork(ctx, userID, name)
+	if err != nil {
+		return "", false, err
 	}
-	return name, nil
+	return name, created, nil
 }
 
-func (s *UserSandbox) claimOrCreateNetwork(ctx context.Context, userID, name string) error {
+func (s *UserSandbox) claimOrCreateNetwork(ctx context.Context, userID, name string) (bool, error) {
 	info, err := s.client.api.NetworkInspect(ctx, name, network.InspectOptions{})
 	if err == nil {
-		return claimNetwork(name, userID, info)
+		return false, claimNetwork(name, userID, info)
 	}
 	if engineKind(err) != sandboxerr.KindNotFound {
-		return wrapEngine("network.inspect", err)
+		return false, wrapEngine("network.inspect", err)
 	}
 	_, err = s.client.api.NetworkCreate(ctx, name, network.CreateOptions{
 		Driver: "bridge",
@@ -309,16 +327,16 @@ func (s *UserSandbox) claimOrCreateNetwork(ctx context.Context, userID, name str
 		},
 	})
 	if err == nil {
-		return nil
+		return true, nil
 	}
 	if engineKind(err) != sandboxerr.KindConflict {
-		return wrapEngine("network.create", err)
+		return false, wrapEngine("network.create", err)
 	}
 	info, ierr := s.client.api.NetworkInspect(ctx, name, network.InspectOptions{})
 	if ierr != nil {
-		return wrapEngine("network.inspect", ierr)
+		return false, wrapEngine("network.inspect", ierr)
 	}
-	return claimNetwork(name, userID, info)
+	return false, claimNetwork(name, userID, info)
 }
 
 func claimNetwork(name, userID string, info network.Inspect) error {
@@ -365,35 +383,96 @@ func (s *UserSandbox) Create(ctx context.Context, opts CreateOptions) (CreateRes
 		vol = gotVol
 	}
 
-	var hostPorts []int
-	if len(opts.Expose) > 0 {
-		specs, err := bindFromPool(s.pool, userID, opts.Expose)
-		if err != nil {
-			return CreateResult{}, managerError("分配宿主机端口", err, errorContext{Ref: userID, Image: opts.Image})
+	basePorts := append([]string(nil), opts.Ports...)
+	baseLabels := cloneLabels(opts.Labels)
+	var blockedPorts []int
+	for attempt := 0; attempt < 2; attempt++ {
+		opts.Ports = append([]string(nil), basePorts...)
+		opts.Labels = cloneLabels(baseLabels)
+		var hostPorts []int
+		if len(opts.Expose) > 0 {
+			specs, allocErr := bindFromPool(s.pool, userID, opts.Expose)
+			if allocErr != nil {
+				releasePorts(s.pool, blockedPorts)
+				if errors.Is(allocErr, ErrMultiPortRestricted) {
+					s.observe(ctx, "create", "portpool.restrict", strings.TrimSpace(opts.Name), userID, allocErr)
+				}
+				return CreateResult{}, managerError("分配宿主机端口", allocErr, errorContext{Ref: userID, Image: opts.Image})
+			}
+			hostPorts = specs.hosts
+			opts.Ports = append(opts.Ports, specs.bindings...)
+			opts.Labels[labelHostPorts] = joinInts(hostPorts)
+			if s.pool.Stats().Warn {
+				s.observe(ctx, "create", "portpool.warn", strings.TrimSpace(opts.Name), userID, nil)
+			}
 		}
-		hostPorts = specs.hosts
-		opts.Ports = append(append([]string{}, opts.Ports...), specs.bindings...)
-		opts.Labels[labelHostPorts] = joinInts(hostPorts)
-	}
 
-	got, err := s.client.CreateContainer(ctx, opts)
-	if err != nil {
-		for _, p := range hostPorts {
-			s.pool.Release(p)
+		got, createErr := s.client.CreateContainer(ctx, opts)
+		if createErr == nil {
+			releasePorts(s.pool, blockedPorts)
+			s.mu.Lock()
+			s.leases[got.ID] = hostPorts
+			s.mu.Unlock()
+			got.Network = netName
+			got.HostPorts = hostPorts
+			got.Volume = vol.Name
+			got.VolumeReused = vol.Reused
+			return got, nil
 		}
-		return CreateResult{}, managerError("创建容器", err, errorContext{
+		if attempt == 0 && len(hostPorts) > 0 && isPortBindingConflict(createErr) {
+			blockedPorts = append(blockedPorts, hostPorts...)
+			continue
+		}
+		releasePorts(s.pool, hostPorts)
+		releasePorts(s.pool, blockedPorts)
+		return CreateResult{}, managerError("创建容器", createErr, errorContext{
 			Ref:   strings.TrimSpace(opts.Name),
 			Image: strings.TrimSpace(opts.Image),
 		})
 	}
-	s.mu.Lock()
-	s.leases[got.ID] = hostPorts
-	s.mu.Unlock()
-	got.Network = netName
-	got.HostPorts = hostPorts
-	got.Volume = vol.Name
-	got.VolumeReused = vol.Reused
-	return got, nil
+	return CreateResult{}, sandboxerr.WrapKind("创建容器", sandboxerr.KindUnknown,
+		fmt.Errorf("创建容器失败：端口重试流程未返回结果"))
+}
+
+func (s *UserSandbox) PortPoolStats() PortPoolStats {
+	if s == nil || s.pool == nil {
+		return PortPoolStats{}
+	}
+	return s.pool.Stats()
+}
+
+func (s *UserSandbox) observe(ctx context.Context, operation, stage, instanceID, userID string, err error) {
+	if s == nil || s.observer == nil {
+		return
+	}
+	event := sandbox.OperationEvent{
+		Operation:  operation,
+		Stage:      stage,
+		InstanceID: instanceID,
+		UserID:     userID,
+		Kind:       sandboxerr.Classify(err),
+		Err:        err,
+	}
+	func() {
+		defer func() { _ = recover() }()
+		s.observer.Observe(ctx, event)
+	}()
+}
+
+func releasePorts(pool *PortPool, ports []int) {
+	for _, port := range ports {
+		pool.Release(port)
+	}
+}
+
+func isPortBindingConflict(err error) bool {
+	if !sandboxerr.IsConflict(err) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "port is already allocated") ||
+		strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "bind for")
 }
 
 type poolBindings struct {
@@ -402,6 +481,15 @@ type poolBindings struct {
 }
 
 func bindFromPool(pool *PortPool, owner string, expose []string) (poolBindings, error) {
+	var count int
+	for _, item := range expose {
+		if strings.TrimSpace(item) != "" {
+			count++
+		}
+	}
+	if err := pool.Admit(count); err != nil {
+		return poolBindings{}, err
+	}
 	var out poolBindings
 	for _, item := range expose {
 		item = strings.TrimSpace(item)
@@ -587,6 +675,21 @@ func (s *UserSandbox) TryReap(ctx context.Context, userID string) error {
 		return sandboxerr.WrapKind("释放用户网络", sandboxerr.KindInvalid,
 			fmt.Errorf("%w: user id is empty", sandboxerr.ErrInvalid))
 	}
+	return s.reapUser(ctx, userID)
+}
+
+// ReleaseCreatedNetwork 回滚本次 provision 新建且尚未承载容器的用户网络。
+func (s *UserSandbox) ReleaseCreatedNetwork(ctx context.Context, userID string) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return sandboxerr.WrapKind("释放用户网络", sandboxerr.KindInvalid,
+			fmt.Errorf("%w: user id is empty", sandboxerr.ErrInvalid))
+	}
+	s.mu.Lock()
+	if st := s.users[userID]; st != nil {
+		st.active = false
+	}
+	s.mu.Unlock()
 	return s.reapUser(ctx, userID)
 }
 

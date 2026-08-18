@@ -49,7 +49,12 @@ func BindOrchestrator(c *Client, sb *UserSandbox, prefix string) (*sandbox.Servi
 		prefix = DefaultNetworkPrefix
 	}
 	rt := runtimeAdapter{sb: sb, mgr: c.Containers()}
-	return sandbox.New(sandbox.Config{Prefix: prefix}, sandbox.Plugins{
+	return sandbox.New(sandbox.Config{
+		Prefix:          prefix,
+		DefaultMemory:   sb.defaultMemory,
+		DefaultNanoCPUs: sb.defaultNanoCPUs,
+		Observer:        sb.observer,
+	}, sandbox.Plugins{
 		Runtime:  rt,
 		Network:  networkAdapter{sb: sb},
 		Storage:  storageAdapter{ws: sb.Workspace()},
@@ -59,18 +64,24 @@ func BindOrchestrator(c *Client, sb *UserSandbox, prefix string) (*sandbox.Servi
 }
 
 func (a runtimeAdapter) Create(ctx context.Context, req sandbox.RuntimeCreate) (sandbox.RuntimeContainer, error) {
+	labelNetwork := strings.TrimSpace(req.Labels[sandbox.LabelNetwork])
+	if network := strings.TrimSpace(req.Network); network != "" && labelNetwork != "" && network != labelNetwork {
+		return sandbox.RuntimeContainer{}, sandboxerr.WrapKind("创建实例", sandboxerr.KindInvalid,
+			fmt.Errorf("%w: runtime network %q does not match label %q", sandboxerr.ErrInvalid, network, labelNetwork))
+	}
 	opts := CreateOptions{
-		Name:       req.Name,
-		Image:      req.Image,
-		Cmd:        req.Cmd,
-		Env:        req.Env,
-		Labels:     req.Labels,
-		Memory:     req.Memory,
-		NanoCPUs:   req.NanoCPUs,
-		Expose:     req.Expose,
-		UserID:     req.Labels[sandbox.LabelUser],
-		InstanceID: req.Labels[sandbox.LabelInstance],
-		SkipPull:   req.SkipPull,
+		Name:        req.Name,
+		Image:       req.Image,
+		Cmd:         req.Cmd,
+		Env:         req.Env,
+		Labels:      req.Labels,
+		Memory:      req.Memory,
+		NanoCPUs:    req.NanoCPUs,
+		Expose:      req.Expose,
+		Binds:       append([]string(nil), req.Binds...),
+		NetworkMode: req.Network,
+		UserID:      req.Labels[sandbox.LabelUser],
+		SkipPull:    req.SkipPull,
 	}
 	got, err := a.sb.Create(ctx, opts)
 	if err != nil {
@@ -124,16 +135,29 @@ func (n networkAdapter) Ensure(ctx context.Context, userID string) (string, erro
 	return n.sb.EnsureNetwork(ctx, userID)
 }
 
+func (n networkAdapter) EnsureTracked(ctx context.Context, userID string) (string, bool, error) {
+	return n.sb.EnsureNetworkTracked(ctx, userID)
+}
+
 func (n networkAdapter) Release(ctx context.Context, userID string) error {
 	return n.sb.TryReap(ctx, userID)
 }
 
+func (n networkAdapter) ReleaseCreated(ctx context.Context, userID string) error {
+	return n.sb.ReleaseCreatedNetwork(ctx, userID)
+}
+
 func (s storageAdapter) Ensure(ctx context.Context, instanceID string, labels map[string]string) (sandbox.Volume, error) {
+	vol, _, err := s.EnsureTracked(ctx, instanceID, labels)
+	return vol, err
+}
+
+func (s storageAdapter) EnsureTracked(ctx context.Context, instanceID string, labels map[string]string) (sandbox.Volume, bool, error) {
 	info, err := s.ws.EnsureLabels(ctx, instanceID, labels)
 	if err != nil {
-		return sandbox.Volume{}, err
+		return sandbox.Volume{}, false, err
 	}
-	return volumeFromInfo(info), nil
+	return volumeFromInfo(info), !info.Reused, nil
 }
 
 func (s storageAdapter) Inspect(ctx context.Context, instanceID string) (sandbox.Volume, error) {

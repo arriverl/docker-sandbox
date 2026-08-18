@@ -2,15 +2,118 @@ package dockerx_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/errdefs"
 
 	"github.com/gitproduct/docker-sandbox/dockerx"
+	"github.com/gitproduct/docker-sandbox/sandbox"
 	"github.com/gitproduct/docker-sandbox/sandboxerr"
 )
+
+func TestUserSandbox_RetriesPortBindingConflictWithoutLeaseLeak(t *testing.T) {
+	fake := &fakeEngine{
+		createID:      "c1",
+		createErrOnce: errdefs.Conflict(errors.New("Bind for 0.0.0.0 failed: port is already allocated")),
+	}
+	pool := dockerx.NewPortPool(dockerx.PortPoolConfig{Base: 20000, Checker: &fakeOccupancy{}})
+	sb := dockerx.NewUserSandbox(dockerx.NewWithAPI(fake), dockerx.UserSandboxConfig{
+		Prefix: "sandbox",
+		Pool:   pool,
+	})
+
+	got, err := sb.Create(context.Background(), dockerx.CreateOptions{
+		Image:  "alpine",
+		UserID: "alice",
+		Name:   "box",
+		Expose: []string{"80"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(got.HostPorts) != 1 {
+		t.Fatalf("HostPorts=%v", got.HostPorts)
+	}
+	if got.HostPorts[0] == 20000 {
+		t.Fatalf("retry reused conflicted port: %v", got.HostPorts)
+	}
+	if got := pool.InUse(); got != 1 {
+		t.Fatalf("pool in use=%d want 1", got)
+	}
+	if got := fake.countOps("create"); got != 2 {
+		t.Fatalf("container create count=%d want 2", got)
+	}
+}
+
+func TestUserSandbox_RejectsMultiPortWhenPoolRestricted(t *testing.T) {
+	fake := &fakeEngine{createID: "c1"}
+	pool := dockerx.NewPortPool(dockerx.PortPoolConfig{Base: 28000, Checker: &fakeOccupancy{}})
+	for i := 0; i < dockerx.PortPoolRestrictMark(dockerx.PortPoolSize); i++ {
+		if _, err := pool.Allocate("fill"); err != nil {
+			t.Fatalf("fill %d: %v", i, err)
+		}
+	}
+	observer := &recordingSandboxObserver{}
+	sb := dockerx.NewUserSandbox(dockerx.NewWithAPI(fake), dockerx.UserSandboxConfig{
+		Prefix:   "sandbox",
+		Pool:     pool,
+		Observer: observer,
+	})
+	inUse := pool.InUse()
+
+	_, err := sb.Create(context.Background(), dockerx.CreateOptions{
+		Image:  "alpine",
+		UserID: "alice",
+		Name:   "box",
+		Expose: []string{"80", "443"},
+	})
+	if !sandboxerr.IsConflict(err) {
+		t.Fatalf("Create=%v want conflict", err)
+	}
+	if pool.InUse() != inUse {
+		t.Fatalf("create must not leak ports: in use=%d want %d", pool.InUse(), inUse)
+	}
+	if fake.countOps("create") != 0 {
+		t.Fatalf("restricted create must not call Docker create")
+	}
+	if !observer.hasStage("portpool.restrict") {
+		t.Fatalf("observer stages=%v", observer.stages)
+	}
+
+	got, err := sb.Create(context.Background(), dockerx.CreateOptions{
+		Image:  "alpine",
+		UserID: "alice",
+		Name:   "single",
+		Expose: []string{"80"},
+	})
+	if err != nil {
+		t.Fatalf("single-port Create: %v", err)
+	}
+	if len(got.HostPorts) != 1 {
+		t.Fatalf("HostPorts=%v", got.HostPorts)
+	}
+}
+
+type recordingSandboxObserver struct {
+	stages []string
+}
+
+func (o *recordingSandboxObserver) Observe(_ context.Context, event sandbox.OperationEvent) {
+	o.stages = append(o.stages, event.Stage)
+}
+
+func (o *recordingSandboxObserver) hasStage(stage string) bool {
+	for _, got := range o.stages {
+		if got == stage {
+			return true
+		}
+	}
+	return false
+}
 
 func newUserSandbox(t *testing.T, fake *fakeEngine) *dockerx.UserSandbox {
 	t.Helper()

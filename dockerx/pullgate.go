@@ -1,10 +1,13 @@
 package dockerx
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 type pullCall struct {
-	wg  sync.WaitGroup
-	err error
+	done chan struct{}
+	err  error
 }
 
 type pullGate struct {
@@ -16,7 +19,7 @@ func newPullGate() *pullGate {
 	return &pullGate{in: map[string]*pullCall{}}
 }
 
-func (g *pullGate) Do(key string, fn func() error) error {
+func (g *pullGate) Do(ctx context.Context, key string, fn func() error) error {
 	if g == nil {
 		return fn()
 	}
@@ -26,11 +29,14 @@ func (g *pullGate) Do(key string, fn func() error) error {
 	}
 	if c, ok := g.in[key]; ok {
 		g.mu.Unlock()
-		c.wg.Wait()
-		return c.err
+		select {
+		case <-c.done:
+			return c.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	c := &pullCall{}
-	c.wg.Add(1)
+	c := &pullCall{done: make(chan struct{})}
 	g.in[key] = c
 	g.mu.Unlock()
 
@@ -38,7 +44,7 @@ func (g *pullGate) Do(key string, fn func() error) error {
 
 	g.mu.Lock()
 	delete(g.in, key)
+	close(c.done)
 	g.mu.Unlock()
-	c.wg.Done()
 	return c.err
 }

@@ -1,7 +1,9 @@
 package dockerx
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,7 +17,48 @@ const (
 	PortPoolSize = 500
 	// DefaultPortBase 是端口池起始端口（含）。池范围为 [Base, Base+PortPoolSize)。
 	DefaultPortBase = 20000
+	// PortPoolWarnRatio 是告警水位。默认 500 端口时对应 350 个。
+	PortPoolWarnRatio = 0.70
+	// PortPoolRestrictRatio 是多端口实例准入水位。默认 500 端口时对应 425 个。
+	PortPoolRestrictRatio = 0.85
 )
+
+// ErrMultiPortRestricted 表示端口池已达 85% 水位，拒绝新的多端口实例。
+var ErrMultiPortRestricted = errors.New("host port pool refuses new multi-port instance")
+
+// PortPoolStats 描述端口池占用与运维水位。
+type PortPoolStats struct {
+	Size              int
+	InUse             int
+	WarnMark          int
+	RestrictMark      int
+	Warn              bool
+	RestrictMultiPort bool
+}
+
+// PortPoolWarnMark 返回告警占用数。
+func PortPoolWarnMark(size int) int {
+	return ratioMark(size, PortPoolWarnRatio)
+}
+
+// PortPoolRestrictMark 返回停止接收多端口新实例的占用数。
+func PortPoolRestrictMark(size int) int {
+	return ratioMark(size, PortPoolRestrictRatio)
+}
+
+func ratioMark(size int, ratio float64) int {
+	if size <= 0 {
+		return 0
+	}
+	mark := int(math.Ceil(float64(size) * ratio))
+	if mark < 1 {
+		mark = 1
+	}
+	if mark > size {
+		return size
+	}
+	return mark
+}
 
 // PortChecker 检测宿主机端口是否已被占用。
 type PortChecker interface {
@@ -98,6 +141,9 @@ func (p *PortPool) AllocateN(owner string, n int) ([]int, error) {
 	if n <= 0 {
 		return nil, nil
 	}
+	if err := p.Admit(n); err != nil {
+		return nil, err
+	}
 	var out []int
 	err := p.withPersist(func() error {
 		out = make([]int, 0, n)
@@ -168,10 +214,45 @@ func (p *PortPool) ReleaseOwner(owner string) {
 
 // InUse 返回当前已分配端口数。
 func (p *PortPool) InUse() int {
-	n := 0
+	return p.Stats().InUse
+}
+
+// Stats 返回端口池占用与水位。
+func (p *PortPool) Stats() PortPoolStats {
+	if p == nil {
+		return PortPoolStats{}
+	}
+	var st PortPoolStats
 	_ = p.withPersist(func() error {
-		n = len(p.used)
+		st = p.statsLocked()
 		return nil
 	})
-	return n
+	return st
+}
+
+func (p *PortPool) statsLocked() PortPoolStats {
+	size := p.size
+	inUse := len(p.used)
+	warnMark := PortPoolWarnMark(size)
+	restrictMark := PortPoolRestrictMark(size)
+	return PortPoolStats{
+		Size:              size,
+		InUse:             inUse,
+		WarnMark:          warnMark,
+		RestrictMark:      restrictMark,
+		Warn:              inUse >= warnMark && warnMark > 0,
+		RestrictMultiPort: inUse >= restrictMark && restrictMark > 0,
+	}
+}
+
+// Admit 在分配前检查运维准入。n>1 且占用已达 85% 时拒绝多端口新实例。
+func (p *PortPool) Admit(n int) error {
+	if p == nil || n <= 1 {
+		return nil
+	}
+	if !p.Stats().RestrictMultiPort {
+		return nil
+	}
+	return sandboxerr.WrapKind("port.allocate", sandboxerr.KindConflict,
+		fmt.Errorf("%w: %w", sandboxerr.ErrConflict, ErrMultiPortRestricted))
 }

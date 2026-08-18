@@ -44,6 +44,11 @@ type Network interface {
 	Release(ctx context.Context, userID string) error
 }
 
+type trackedNetwork interface {
+	EnsureTracked(ctx context.Context, userID string) (name string, created bool, err error)
+	ReleaseCreated(ctx context.Context, userID string) error
+}
+
 // Storage 管理 workspace 卷。
 type Storage interface {
 	Ensure(ctx context.Context, instanceID string, labels map[string]string) (Volume, error)
@@ -58,6 +63,12 @@ type Volume struct {
 	InstanceID string
 	MountPath  string
 	Labels     map[string]string
+}
+
+// trackedStorage 是 Storage 的可选扩展。默认 Docker 插件用它告知编排器
+// Ensure 是否新建了卷，从而在后续步骤失败时安全补偿，避免误删复用卷。
+type trackedStorage interface {
+	EnsureTracked(ctx context.Context, instanceID string, labels map[string]string) (Volume, bool, error)
 }
 
 // Registry 以 instance_id 为键登记实例。容器优先，否则回落到卷（destroyed）。

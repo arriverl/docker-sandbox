@@ -109,7 +109,7 @@ func (c *Client) ensureImage(ctx context.Context, ref string) error {
 	if c.pulls == nil {
 		c.pulls = newPullGate()
 	}
-	return c.pulls.Do(ref, func() error {
+	return c.pulls.Do(ctx, ref, func() error {
 		return c.pullImage(ctx, ref)
 	})
 }
@@ -441,10 +441,10 @@ func managerError(action string, err error, ctx errorContext) error {
 		parts = append(parts, "状态="+label)
 	}
 	if len(parts) == 0 {
-		return sandboxerr.WrapKind(action, kind, fmt.Errorf("%s失败：%s", action, reason))
+		return sandboxerr.WrapKind(action, kind, fmt.Errorf("%s失败：%s: %w", action, reason, err))
 	}
 	return sandboxerr.WrapKind(action, kind,
-		fmt.Errorf("%s失败：%s；%s", action, strings.Join(parts, ", "), reason))
+		fmt.Errorf("%s失败：%s；%s: %w", action, strings.Join(parts, ", "), reason, err))
 }
 
 func (m *ContainerManager) annotate(ctx context.Context, action, id string, err error, extra errorContext) error {

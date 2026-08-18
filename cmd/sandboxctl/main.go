@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -21,6 +22,8 @@ func main() {
 	noProxy := flag.Bool("no-proxy", false, "disable HTTP proxy (ignore HTTP_PROXY/HTTPS_PROXY)")
 	timeout := flag.Duration("timeout", 5*time.Minute, "request timeout (create may pull images)")
 	prefix := flag.String("prefix", dockerx.DefaultNetworkPrefix, "name prefix for {prefix}-net-{userId} and {prefix}-ws-{instanceId}")
+	defaultMemory := flag.String("default-memory", "256m", "default instance memory limit")
+	defaultCPUs := flag.String("default-cpus", "0.5", "default instance CPU limit")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -42,9 +45,21 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	defaultMemoryBytes, err := parseMemory(*defaultMemory)
+	if err != nil {
+		fatal(err)
+	}
+	defaultNanoCPUs, err := parseCPUs(*defaultCPUs)
+	if err != nil {
+		fatal(err)
+	}
 
 	mgr := client.Containers()
-	sb := dockerx.NewUserSandbox(client, dockerx.UserSandboxConfig{Prefix: *prefix})
+	sb := dockerx.NewUserSandbox(client, dockerx.UserSandboxConfig{
+		Prefix:          *prefix,
+		DefaultMemory:   defaultMemoryBytes,
+		DefaultNanoCPUs: defaultNanoCPUs,
+	})
 	orch, err := dockerx.BindOrchestrator(client, sb, *prefix)
 	if err != nil {
 		fatal(err)
@@ -271,7 +286,7 @@ func runRestore(ctx context.Context, orch *sandbox.Service, args []string) (sand
 	if id == "" {
 		id = requireArg("restore", fs.Args())
 	}
-	return orch.Restore(ctx, id, sandbox.RestoreOptions{KeepVolume: !*reset})
+	return orch.Restore(ctx, id, sandbox.RestoreOptions{KeepVolume: !*reset, ResetVolume: *reset})
 }
 
 func runWait(ctx context.Context, orch *sandbox.Service, args []string) (sandbox.Instance, error) {
@@ -328,6 +343,10 @@ func runBuild(ctx context.Context, b *dockerx.ImageBuilder, args []string) (dock
 	if *dockerfile != "" {
 		raw, err := os.ReadFile(*dockerfile)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return dockerx.BuildResult{}, sandboxerr.WrapKind("读取 Dockerfile", sandboxerr.KindNotFound,
+					fmt.Errorf("%w: %v", sandboxerr.ErrNotFound, err))
+			}
 			return dockerx.BuildResult{}, err
 		}
 		spec.Dockerfile = string(raw)
@@ -416,7 +435,8 @@ func parseMemory(s string) (int64, error) {
 	}
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil || n < 0 {
-		return 0, fmt.Errorf("invalid memory limit %q", s)
+		return 0, sandboxerr.WrapKind("解析内存限制", sandboxerr.KindInvalid,
+			fmt.Errorf("%w: invalid memory limit %q", sandboxerr.ErrInvalid, s))
 	}
 	return n * mult, nil
 }
@@ -425,7 +445,8 @@ func parseCPUs(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil || f < 0 {
-		return 0, fmt.Errorf("invalid cpu limit %q", s)
+		return 0, sandboxerr.WrapKind("解析 CPU 限制", sandboxerr.KindInvalid,
+			fmt.Errorf("%w: invalid cpu limit %q", sandboxerr.ErrInvalid, s))
 	}
 	return int64(f * 1e9), nil
 }

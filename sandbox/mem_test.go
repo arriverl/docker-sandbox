@@ -134,15 +134,24 @@ func (r memRuntime) Exec(_ context.Context, containerID string, cmd []string) er
 	return nil
 }
 
-func (n memNetwork) Ensure(_ context.Context, userID string) (string, error) {
+func (n memNetwork) Ensure(ctx context.Context, userID string) (string, error) {
+	name, _, err := n.EnsureTracked(ctx, userID)
+	return name, err
+}
+
+func (n memNetwork) EnsureTracked(_ context.Context, userID string) (string, bool, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if name, ok := n.nets[userID]; ok {
-		return name, nil
+		return name, false, nil
 	}
 	name := "sandbox-net-" + sanitizeName(userID)
 	n.nets[userID] = name
-	return name, nil
+	return name, true, nil
+}
+
+func (n memNetwork) ReleaseCreated(ctx context.Context, userID string) error {
+	return n.Release(ctx, userID)
 }
 
 func (n memNetwork) Release(_ context.Context, userID string) error {
@@ -157,7 +166,12 @@ func (n memNetwork) Release(_ context.Context, userID string) error {
 	return nil
 }
 
-func (s memStorage) Ensure(_ context.Context, instanceID string, labels map[string]string) (Volume, error) {
+func (s memStorage) Ensure(ctx context.Context, instanceID string, labels map[string]string) (Volume, error) {
+	vol, _, err := s.EnsureTracked(ctx, instanceID, labels)
+	return vol, err
+}
+
+func (s memStorage) EnsureTracked(_ context.Context, instanceID string, labels map[string]string) (Volume, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if vol, ok := s.vols[instanceID]; ok {
@@ -169,7 +183,7 @@ func (s memStorage) Ensure(_ context.Context, instanceID string, labels map[stri
 				vol.Labels[k] = v
 			}
 		}
-		return *vol, nil
+		return *vol, false, nil
 	}
 	vol := &Volume{
 		Name:       "sandbox-ws-" + sanitizeName(instanceID),
@@ -183,7 +197,7 @@ func (s memStorage) Ensure(_ context.Context, instanceID string, labels map[stri
 	vol.Labels[LabelRole] = RoleWorkspace
 	vol.Labels[LabelInstance] = instanceID
 	s.vols[instanceID] = vol
-	return *vol, nil
+	return *vol, true, nil
 }
 
 func (s memStorage) Inspect(_ context.Context, instanceID string) (Volume, error) {

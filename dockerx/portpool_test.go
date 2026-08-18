@@ -1,6 +1,7 @@
 package dockerx_test
 
 import (
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -153,6 +154,78 @@ func TestPortPool_ReserveSkipsPortOnAllocate(t *testing.T) {
 	}
 	if got != 23001 {
 		t.Fatalf("port = %d, want 23001", got)
+	}
+}
+
+func TestPortPool_StatsWarnsAt70Percent(t *testing.T) {
+	pool := dockerx.NewPortPool(dockerx.PortPoolConfig{Base: 25000, Checker: &fakeOccupancy{}})
+	wantWarn := dockerx.PortPoolWarnMark(dockerx.PortPoolSize)
+	if wantWarn != 350 {
+		t.Fatalf("warn mark=%d want 350", wantWarn)
+	}
+	for i := 0; i < wantWarn-1; i++ {
+		if _, err := pool.Allocate("fill"); err != nil {
+			t.Fatalf("alloc %d: %v", i, err)
+		}
+	}
+	stats := pool.Stats()
+	if stats.Warn || stats.RestrictMultiPort || stats.InUse != wantWarn-1 {
+		t.Fatalf("below warn: %+v", stats)
+	}
+	if _, err := pool.Allocate("fill"); err != nil {
+		t.Fatal(err)
+	}
+	stats = pool.Stats()
+	if !stats.Warn || stats.RestrictMultiPort || stats.InUse != wantWarn {
+		t.Fatalf("at warn: %+v", stats)
+	}
+}
+
+func TestPortPool_RestrictsMultiPortAt85Percent(t *testing.T) {
+	pool := dockerx.NewPortPool(dockerx.PortPoolConfig{Base: 26000, Checker: &fakeOccupancy{}})
+	wantRestrict := dockerx.PortPoolRestrictMark(dockerx.PortPoolSize)
+	if wantRestrict != 425 {
+		t.Fatalf("restrict mark=%d want 425", wantRestrict)
+	}
+	for i := 0; i < wantRestrict; i++ {
+		if _, err := pool.Allocate("fill"); err != nil {
+			t.Fatalf("alloc %d: %v", i, err)
+		}
+	}
+	stats := pool.Stats()
+	if !stats.Warn || !stats.RestrictMultiPort {
+		t.Fatalf("at restrict: %+v", stats)
+	}
+	if err := pool.Admit(2); !sandboxerr.IsConflict(err) {
+		t.Fatalf("Admit(2)=%v want conflict", err)
+	}
+	if _, err := pool.AllocateN("multi", 2); !sandboxerr.IsConflict(err) || !errors.Is(err, dockerx.ErrMultiPortRestricted) {
+		t.Fatalf("AllocateN=%v want multi-port restrict", err)
+	}
+	if pool.InUse() != wantRestrict {
+		t.Fatalf("restrict must not leak leases: in use=%d", pool.InUse())
+	}
+	if _, err := pool.Allocate("single"); err != nil {
+		t.Fatalf("single-port alloc should still work: %v", err)
+	}
+}
+
+func TestPortPool_AdmitAllowsMultiPortBelowRestrict(t *testing.T) {
+	pool := dockerx.NewPortPool(dockerx.PortPoolConfig{Base: 27000, Checker: &fakeOccupancy{}})
+	for i := 0; i < dockerx.PortPoolRestrictMark(dockerx.PortPoolSize)-1; i++ {
+		if _, err := pool.Allocate("fill"); err != nil {
+			t.Fatalf("alloc %d: %v", i, err)
+		}
+	}
+	if err := pool.Admit(2); err != nil {
+		t.Fatalf("Admit below restrict: %v", err)
+	}
+	got, err := pool.AllocateN("multi", 2)
+	if err != nil {
+		t.Fatalf("AllocateN: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ports=%v", got)
 	}
 }
 
