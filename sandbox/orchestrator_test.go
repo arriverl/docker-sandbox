@@ -53,6 +53,52 @@ func TestNewRejectsNegativeDefaultLimits(t *testing.T) {
 	if _, err := New(Config{DefaultNanoCPUs: -1}, world.plugins()); !sandboxerr.IsInvalid(err) {
 		t.Fatalf("negative nanoCPUs err=%v want invalid", err)
 	}
+	if _, err := New(Config{MaxInstances: -1}, world.plugins()); !sandboxerr.IsInvalid(err) {
+		t.Fatalf("negative max instances err=%v want invalid", err)
+	}
+}
+
+func TestNewAppliesRecommendedDefaultsWhenUnspecified(t *testing.T) {
+	world := newMemWorld()
+	plugins := world.plugins()
+	runtime := &captureCreateRuntime{Runtime: plugins.Runtime}
+	plugins.Runtime = runtime
+	svc, err := New(Config{Prefix: "sandbox"}, plugins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := sampleSpec()
+	spec.Memory = 0
+	spec.NanoCPUs = 0
+	if _, err := svc.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.last.Memory != RecommendedDefaultMemory || runtime.last.NanoCPUs != RecommendedDefaultNanoCPUs {
+		t.Fatalf("defaults memory=%d nanoCPUs=%d", runtime.last.Memory, runtime.last.NanoCPUs)
+	}
+}
+
+func TestCreate_RejectsWhenMaxInstancesReached(t *testing.T) {
+	world := newMemWorld()
+	svc, err := New(Config{Prefix: "sandbox", MaxInstances: 1}, world.plugins())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Create(context.Background(), sampleSpec()); err != nil {
+		t.Fatal(err)
+	}
+	second := sampleSpec()
+	second.InstanceID = "box2"
+	_, err = svc.Create(context.Background(), second)
+	if !sandboxerr.IsConflict(err) {
+		t.Fatalf("second create err=%v want conflict", err)
+	}
+	if err := svc.Destroy(context.Background(), "box1", DestroyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Create(context.Background(), second); err != nil {
+		t.Fatalf("create after destroy should reuse capacity: %v", err)
+	}
 }
 
 func TestCreate_RejectsOversizedPersistedSpec(t *testing.T) {

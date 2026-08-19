@@ -8,27 +8,29 @@
 
 ## 生命周期与恢复
 
-- `Create` 只创建实例，不自动启动。
+- `Create` 只创建实例，不自动启动。平台开通用 `EnsureRunning`。
 - 同一 `instance_id` 的变更操作在单进程内串行执行。
 - 创建失败会补偿本次新建的 workspace；复用的 workspace 不会被误删。
-- 补偿首次失败时，同进程后续 `Create` 会先重试补偿。
+- 补偿首次失败时，同进程后续 `Create` 会先重试补偿。配置 `JournalPath` 后该记录落盘，进程重启仍可重放。
 - `Destroy` 默认保留 workspace；`Purge=true` 才删除数据。
 - `Restore` 保持 `instance_id`，但 Docker 容器 ID 和 HostPort 可变化。
 - `RestoreOptions{ResetVolume:true}` 会先删除旧容器，再删除 workspace；该操作会永久丢弃工作区数据。零值选项默认保留 workspace。
+- 已销毁再 Create：`conflict`，`sandboxerr.ActionOf(err) == use_restore`。
+- 达 `MaxInstances`：`conflict`，`ActionOf == retry_after`。
 
 平台不得缓存 Docker 容器 ID 或 Restore 前的 HostPort，应在恢复后重新调用 `Get`。
 
 ## 默认资源配额
 
-通过 `sandbox.Config.DefaultMemory` 和 `DefaultNanoCPUs` 设置平台默认值。调用方显式指定的非零值优先。生产环境不得同时把两个默认值保留为零，否则单个沙箱可以消耗 Docker Desktop 虚拟机的全部资源。
+通过 `sandbox.Config.DefaultMemory` 和 `DefaultNanoCPUs` 设置平台默认值。调用方显式指定的非零值优先。未配置时内核会填入推荐值 **256 MiB** 和 **0.5 CPU**，避免单个沙箱吃满 Docker Desktop 虚拟机。`sandboxctl` 额外提供 `-default-memory`、`-default-cpus` 和 `-max-instances`（默认 300）。
 
 建议初始值：
 
-- 内存：每实例 256 MiB
-- CPU：每实例 0.5 CPU（`500_000_000` NanoCPUs）
+- 内存：每实例 256 MiB（`RecommendedDefaultMemory`）
+- CPU：每实例 0.5 CPU（`RecommendedDefaultNanoCPUs`）
+- 活跃实例上限：300（`MaxInstances`，只统计非 `destroyed`）
 - 上层平台并发启动限流：20
 - 日常活跃实例：不超过 200
-- 设计峰值：300
 
 ## 端口池
 
@@ -56,15 +58,12 @@
 
 ## 可观测性
 
-可通过 `sandbox.Config.Observer` 接收 `OperationEvent`。至少记录：
+可通过 `sandbox.Config.Observer` 接收 `OperationEvent`。CLI 默认使用带 wait 心跳的 Observer；JSON 行含 `operation`、`stage`、`instance_id`、`user_id`、`duration_ms`、`kind`、`error`，以及进度字段 `attempt` / `detail` / `current` / `total`。
 
-- `operation`
-- `stage`
-- `instance_id`
-- `user_id`
-- `duration`
-- `kind`
+- `pull.progress`：镜像层下载字节（`current`/`total`）
+- `wait.retry`：第 n 次探测及上次失败原因
 - 补偿和最终错误
+- `portpool.warn` / `portpool.restrict`
 
 建议指标：
 
@@ -93,7 +92,7 @@ go test -count=1 -mod=mod ./... "-coverprofile=coverage.out"
 go tool cover -func coverage.out
 ```
 
-`gofmt -l` 必须无输出。默认 CI 不依赖正在运行的 Docker daemon；真实 Docker smoke 应作为受控环境中的附加门禁。
+`gofmt -l` 必须无输出。默认 CI 不依赖正在运行的 Docker daemon。真实 Docker smoke 在 `.github/workflows/smoke.yml`，需手动触发或周一定时运行，并设置 `DOCKER_SANDBOX_LIVE=1`。
 Windows 本地执行 `-race` 需要启用 CGO 并安装兼容 C 编译器；仓库 CI 在 Ubuntu 独立任务中执行 race detector，Windows 任务负责平台构建、单测、vet 与覆盖率。
 
 PowerShell 必须给 `-coverprofile=coverage.out` 加引号。否则 `.out` 会被拆成独立参数，`go test` 会把它当成包名并报 `malformed module path ".out"`。
@@ -119,11 +118,22 @@ PowerShell 必须给 `-coverprofile=coverage.out` 加引号。否则 `.out` 会�
 3. 容器创建在卷创建后失败时，不遗留不可重试的伪 destroyed 实例。
 4. 端口第一次绑定冲突时，租约不泄漏且第二端口可成功绑定。
 5. workspace 删除失败时，Destroy 仍尝试网络清理并返回聚合错误。
-6. 300 个实例下 `List`、`Get`、并发 Create 和 Restore 的延迟与资源占用。
+6. 300 个实例下 `List`、`Get`、并发 Create 和 Restore 的延迟与资源占用。内存插件基线见下一节；Live Docker 300 仍须在发布周期演练。
+
+## 300 实例延迟基线（内存插件）
+
+`go test -count=1 -mod=mod ./sandbox -run TestScale_300ListAndCreateP95 -v` 在 Windows / Go 1.24.2 上测得（2026-08-19，不经过 Docker Engine）：
+
+| 操作 | 样本 | p95 |
+|---|---|---|
+| `Create` | 300 | 0.75 ms |
+| `List` | 50 次（各 300 条） | 2.9 ms |
+
+这是编排内核 + 内存 Registry 的上限参考，用来证明 300 规模下 List 全量扫描在进程内可接受。真实 Docker Desktop 的 Create/List 还会叠加镜像层、卷和端口池，值班 SLA 仍以 live 演练为准。
 
 ## 已知边界
 
 - 跨进程相同 `instance_id` 的最终互斥仍依赖 Docker 名称冲突和补偿；上层多进程控制面应提供分布式幂等键。
-- Registry 基于 Docker 容器和卷扫描，规模继续扩大时需要基准测试或外部索引。
-- 创建补偿待重试标记是进程内状态；进程在补偿失败后立即退出时，管理员需按错误上下文检查残留 workspace。
-- 同一用户网络默认允许容器间通信；如果实训任务互不信任，应改为每实例网络或增加网络策略层。
+- Registry 基于 Docker 容器和卷扫描；内存 300 实例 List p95 约 3ms，Live 路径需单独取样。
+- 未设置 `JournalPath` 时，创建补偿待重试标记是进程内状态；进程在补偿失败后立即退出时，管理员需按错误上下文检查残留 workspace。
+- 同一用户网络默认允许容器间通信；互不信任实训任务使用 `NetworkIsolation: instance` / CLI `-net-instance`。

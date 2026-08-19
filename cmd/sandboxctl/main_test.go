@@ -17,6 +17,17 @@ func TestParseLimitsReturnInvalidKind(t *testing.T) {
 	}
 }
 
+func TestParseLimitsAcceptRecommendedDefaults(t *testing.T) {
+	mem, err := parseMemory("256m")
+	if err != nil || mem != 256<<20 {
+		t.Fatalf("parseMemory(256m)=%d err=%v", mem, err)
+	}
+	cpus, err := parseCPUs("0.5")
+	if err != nil || cpus != 500_000_000 {
+		t.Fatalf("parseCPUs(0.5)=%d err=%v", cpus, err)
+	}
+}
+
 func TestRunBuildMissingDockerfileReturnsNotFound(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing.Dockerfile")
 	_, err := runBuild(context.Background(), nil, []string{

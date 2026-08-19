@@ -70,6 +70,8 @@ func chineseReason(kind sandboxerr.Kind, err error) string {
 		switch {
 		case strings.Contains(msg, "destroyed") || strings.Contains(msg, "use restore"):
 			return "实例已销毁，请使用还原而不是重新创建"
+		case strings.Contains(msg, "reached max"):
+			return "已达活跃实例上限，请稍后重试或换用新的 instance_id"
 		case strings.Contains(msg, "端口池已满") || strings.Contains(lower, "port pool"):
 			return "宿主机端口池已满（最多 500 个）"
 		case strings.Contains(msg, "already exists"):

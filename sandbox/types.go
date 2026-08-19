@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/gitproduct/docker-sandbox/sandboxerr"
@@ -40,7 +41,38 @@ type Spec struct {
 	Expose     []string
 	Labels     map[string]string
 	SkipPull   bool
+	// NetworkIsolation 为空时每用户一张网络；NetworkPerInstance 时每实例一张网络。
+	NetworkIsolation NetworkIsolation
 }
+
+// NetworkIsolation 控制实例是否独占 Docker 网络。
+type NetworkIsolation string
+
+const (
+	NetworkPerUser     NetworkIsolation = ""
+	NetworkPerInstance NetworkIsolation = "instance"
+)
+
+// InstanceNetworkOwner 返回 per-instance 网络在 Network 插件中的键。
+func InstanceNetworkOwner(instanceID string) string {
+	return "i/" + strings.TrimSpace(instanceID)
+}
+
+func networkOwner(spec Spec) string {
+	if spec.NetworkIsolation == NetworkPerInstance {
+		return InstanceNetworkOwner(spec.InstanceID)
+	}
+	return spec.UserID
+}
+
+const (
+	// RecommendedDefaultMemory 是未配置时每实例默认内存（256 MiB）。
+	RecommendedDefaultMemory int64 = 256 << 20
+	// RecommendedDefaultNanoCPUs 是未配置时每实例默认 CPU（0.5）。
+	RecommendedDefaultNanoCPUs int64 = 500_000_000
+	// DesignPeakInstances 是单机设计峰值，供 MaxInstances 与运维文档对齐。
+	DesignPeakInstances = 300
+)
 
 // Instance 是注册表中的沙箱实例视图。平台主键是 ID（instance_id）。
 type Instance struct {
@@ -100,6 +132,10 @@ type OperationEvent struct {
 	Duration   time.Duration
 	Kind       sandboxerr.Kind
 	Err        error
+	Attempt    int
+	Detail     string
+	Current    int64
+	Total      int64
 }
 
 // Observer 接收编排阶段事件。实现不得阻塞生命周期操作。
@@ -113,5 +149,7 @@ type Config struct {
 	WaitInterval    time.Duration
 	DefaultMemory   int64
 	DefaultNanoCPUs int64
+	MaxInstances    int
 	Observer        Observer
+	JournalPath     string
 }

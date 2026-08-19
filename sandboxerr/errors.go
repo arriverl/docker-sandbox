@@ -26,6 +26,13 @@ const (
 	KindCanceled     Kind = "canceled"
 )
 
+// Next-action hints for conflict and capacity errors.
+const (
+	ActionUseRestore = "use_restore"
+	ActionRetryAfter = "retry_after"
+	ActionReplaceID  = "replace_id"
+)
+
 // Sentinel errors for errors.Is matching on kind.
 var (
 	ErrUnavailable  = errors.New("docker daemon unavailable")
@@ -40,9 +47,10 @@ var (
 
 // Error 是带操作名与分类的包装错误。
 type Error struct {
-	Op   string
-	Kind Kind
-	Err  error
+	Op     string
+	Kind   Kind
+	Err    error
+	Action string
 }
 
 func (e *Error) Error() string {
@@ -108,7 +116,24 @@ func WrapKind(op string, kind Kind, err error) error {
 	if err == nil {
 		return nil
 	}
-	return &Error{Op: op, Kind: kind, Err: err}
+	return &Error{Op: op, Kind: kind, Err: err, Action: ActionOf(err)}
+}
+
+// WrapKindAction 使用指定分类与下一步动作包装错误。
+func WrapKindAction(op string, kind Kind, action string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &Error{Op: op, Kind: kind, Err: err, Action: action}
+}
+
+// ActionOf 返回可程序化的下一步动作；未知错误为空字符串。
+func ActionOf(err error) string {
+	var se *Error
+	if errors.As(err, &se) {
+		return se.Action
+	}
+	return ""
 }
 
 // Classify 将任意错误映射为 Kind。

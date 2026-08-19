@@ -54,8 +54,25 @@ type EngineAPI interface {
 
 // Client 封装 Docker Engine API 客户端。
 type Client struct {
-	api   EngineAPI
-	pulls *pullGate
+	api            EngineAPI
+	pulls          *pullGate
+	onPullProgress func(PullProgress)
+}
+
+// PullProgress 是镜像拉取流中的一层/字节进度。
+type PullProgress struct {
+	ID      string
+	Status  string
+	Current int64
+	Total   int64
+}
+
+// SetPullProgress 注册拉取进度回调。回调不得阻塞。
+func (c *Client) SetPullProgress(fn func(PullProgress)) {
+	if c == nil {
+		return
+	}
+	c.onPullProgress = fn
 }
 
 // New 根据 Config 创建真实 Docker 客户端。

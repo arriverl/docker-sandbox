@@ -157,8 +157,13 @@ func (n memNetwork) ReleaseCreated(ctx context.Context, userID string) error {
 func (n memNetwork) Release(_ context.Context, userID string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	name := n.nets[userID]
 	for _, box := range n.boxes {
-		if box.Labels[LabelUser] == userID && (box.Status == StatusRunning || box.Status == StatusPaused) {
+		onNet := name != "" && box.Network == name
+		if !onNet && name == "" {
+			onNet = box.Labels[LabelUser] == userID
+		}
+		if onNet && (box.Status == StatusRunning || box.Status == StatusPaused) {
 			return nil
 		}
 	}

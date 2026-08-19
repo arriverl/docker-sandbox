@@ -22,6 +22,28 @@ func TestClassify_LocalMissingFileIsNotDockerUnavailable(t *testing.T) {
 	}
 }
 
+func TestWrapKind_NilAndSentinels(t *testing.T) {
+	if err := sandboxerr.WrapKind("op", sandboxerr.KindNotFound, nil); err != nil {
+		t.Fatalf("WrapKind(nil)=%v", err)
+	}
+	err := sandboxerr.WrapKind("get", sandboxerr.KindNotFound, sandboxerr.ErrNotFound)
+	if !sandboxerr.IsNotFound(err) {
+		t.Fatalf("IsNotFound=%v", err)
+	}
+	conflict := sandboxerr.WrapKind("create", sandboxerr.KindConflict, sandboxerr.ErrConflict)
+	if !sandboxerr.IsConflict(conflict) {
+		t.Fatalf("IsConflict=%v", conflict)
+	}
+	unauth := sandboxerr.WrapKind("auth", sandboxerr.KindUnauthorized, sandboxerr.ErrUnauthorized)
+	if !sandboxerr.IsUnauthorized(unauth) {
+		t.Fatalf("IsUnauthorized=%v", unauth)
+	}
+	forbid := sandboxerr.WrapKind("auth", sandboxerr.KindForbidden, sandboxerr.ErrForbidden)
+	if !sandboxerr.IsForbidden(forbid) {
+		t.Fatalf("IsForbidden=%v", forbid)
+	}
+}
+
 func TestWrap_NilReturnsNil(t *testing.T) {
 	if err := sandboxerr.Wrap("ping", nil); err != nil {
 		t.Fatalf("Wrap(nil) = %v, want nil", err)
@@ -84,6 +106,24 @@ func TestClassify_InvalidConfig(t *testing.T) {
 	err := sandboxerr.Wrap("config", sandboxerr.ErrInvalid)
 	if !sandboxerr.IsInvalid(err) {
 		t.Fatal("expected IsInvalid")
+	}
+}
+
+func TestActionOf_DestroyedCreateAndMaxInstances(t *testing.T) {
+	destroyed := sandboxerr.WrapKindAction("instance.create", sandboxerr.KindConflict, sandboxerr.ActionUseRestore, sandboxerr.ErrConflict)
+	if sandboxerr.ActionOf(destroyed) != sandboxerr.ActionUseRestore {
+		t.Fatalf("ActionOf(destroyed)=%q", sandboxerr.ActionOf(destroyed))
+	}
+	wrapped := sandboxerr.WrapKind("创建实例", sandboxerr.KindConflict, destroyed)
+	if sandboxerr.ActionOf(wrapped) != sandboxerr.ActionUseRestore {
+		t.Fatalf("WrapKind must keep action, got %q", sandboxerr.ActionOf(wrapped))
+	}
+	capped := sandboxerr.WrapKindAction("instance.create", sandboxerr.KindConflict, sandboxerr.ActionRetryAfter, sandboxerr.ErrConflict)
+	if sandboxerr.ActionOf(capped) != sandboxerr.ActionRetryAfter {
+		t.Fatalf("ActionOf(capped)=%q", sandboxerr.ActionOf(capped))
+	}
+	if sandboxerr.ActionOf(errors.New("plain")) != "" {
+		t.Fatal("plain error should have empty action")
 	}
 }
 

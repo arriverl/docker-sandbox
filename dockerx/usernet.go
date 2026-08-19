@@ -25,6 +25,7 @@ const (
 	labelHostPorts       = "sandbox.hostports"
 	labelRole            = "sandbox.role"
 	roleUserNet          = "usernet"
+	roleInstNet          = "instnet"
 	roleHold             = "hold"
 )
 
@@ -34,7 +35,9 @@ type UserSandboxConfig struct {
 	Pool            *PortPool
 	DefaultMemory   int64
 	DefaultNanoCPUs int64
+	MaxInstances    int
 	Observer        sandbox.Observer
+	JournalPath     string
 }
 
 // UserSandbox 为每个用户维护独立 Docker 网络，并用端口池分配宿主机端口。
@@ -45,7 +48,9 @@ type UserSandbox struct {
 	workspace       *Workspace
 	defaultMemory   int64
 	defaultNanoCPUs int64
+	maxInstances    int
 	observer        sandbox.Observer
+	journalPath     string
 
 	mu     sync.Mutex
 	users  map[string]*userNetState
@@ -76,9 +81,16 @@ func NewUserSandbox(c *Client, cfg UserSandboxConfig) *UserSandbox {
 		workspace:       NewWorkspace(c, WorkspaceConfig{Prefix: prefix}),
 		defaultMemory:   cfg.DefaultMemory,
 		defaultNanoCPUs: cfg.DefaultNanoCPUs,
+		maxInstances:    cfg.MaxInstances,
 		observer:        cfg.Observer,
+		journalPath:     cfg.JournalPath,
 		users:           map[string]*userNetState{},
 		leases:          map[string][]int{},
+	}
+	if s.client != nil && s.observer != nil {
+		s.client.SetPullProgress(func(p PullProgress) {
+			s.observePull(p)
+		})
 	}
 	_ = s.SeedPorts(context.Background())
 	return s
@@ -159,6 +171,15 @@ func parseHostPorts(raw string) []int {
 		}
 	}
 	return out
+}
+
+// InstanceNetworkOwner 返回 per-instance 网络在 Docker 网络插件中的键。
+func InstanceNetworkOwner(instanceID string) string {
+	return sandbox.InstanceNetworkOwner(instanceID)
+}
+
+func isInstanceNetworkOwner(owner string) bool {
+	return strings.HasPrefix(owner, "i/")
 }
 
 // UserNetworkName 返回 {prefix}-net-{userId}。清洗会改写的 ID 追加短哈希，避免 user@1 与 user-1 撞名。
@@ -319,11 +340,11 @@ func (s *UserSandbox) claimOrCreateNetwork(ctx context.Context, userID, name str
 		Driver: "bridge",
 		Labels: map[string]string{
 			labelUserID:  userID,
-			labelRole:    roleUserNet,
+			labelRole:    netRole(userID),
 			labelNetwork: name,
 		},
 		Options: map[string]string{
-			"com.docker.network.bridge.enable_icc": "true",
+			"com.docker.network.bridge.enable_icc": netICC(userID),
 		},
 	})
 	if err == nil {
@@ -337,6 +358,20 @@ func (s *UserSandbox) claimOrCreateNetwork(ctx context.Context, userID, name str
 		return false, wrapEngine("network.inspect", ierr)
 	}
 	return false, claimNetwork(name, userID, info)
+}
+
+func netRole(owner string) string {
+	if isInstanceNetworkOwner(owner) {
+		return roleInstNet
+	}
+	return roleUserNet
+}
+
+func netICC(owner string) string {
+	if isInstanceNetworkOwner(owner) {
+		return "false"
+	}
+	return "true"
 }
 
 func claimNetwork(name, userID string, info network.Inspect) error {
@@ -364,11 +399,14 @@ func (s *UserSandbox) Create(ctx context.Context, opts CreateOptions) (CreateRes
 				fmt.Errorf("%w: user id is empty", sandboxerr.ErrInvalid)),
 			errorContext{})
 	}
-	netName, err := s.EnsureNetwork(ctx, userID)
-	if err != nil {
-		return CreateResult{}, managerError("创建用户网络", err, errorContext{Ref: userID})
+	netName := strings.TrimSpace(opts.NetworkMode)
+	if netName == "" {
+		got, err := s.EnsureNetwork(ctx, userID)
+		if err != nil {
+			return CreateResult{}, managerError("创建用户网络", err, errorContext{Ref: userID})
+		}
+		netName = got
 	}
-
 	opts.NetworkMode = netName
 	opts.Labels = cloneLabels(opts.Labels)
 	opts.Labels[labelUserID] = userID
@@ -456,6 +494,24 @@ func (s *UserSandbox) observe(ctx context.Context, operation, stage, instanceID,
 	func() {
 		defer func() { _ = recover() }()
 		s.observer.Observe(ctx, event)
+	}()
+}
+
+func (s *UserSandbox) observePull(p PullProgress) {
+	if s == nil || s.observer == nil {
+		return
+	}
+	detail := strings.TrimSpace(strings.TrimSpace(p.Status) + " " + strings.TrimSpace(p.ID))
+	event := sandbox.OperationEvent{
+		Operation: "create",
+		Stage:     "pull.progress",
+		Detail:    detail,
+		Current:   p.Current,
+		Total:     p.Total,
+	}
+	func() {
+		defer func() { _ = recover() }()
+		s.observer.Observe(context.Background(), event)
 	}()
 }
 

@@ -53,7 +53,9 @@ func BindOrchestrator(c *Client, sb *UserSandbox, prefix string) (*sandbox.Servi
 		Prefix:          prefix,
 		DefaultMemory:   sb.defaultMemory,
 		DefaultNanoCPUs: sb.defaultNanoCPUs,
+		MaxInstances:    sb.maxInstances,
 		Observer:        sb.observer,
+		JournalPath:     sb.journalPath,
 	}, sandbox.Plugins{
 		Runtime:  rt,
 		Network:  networkAdapter{sb: sb},

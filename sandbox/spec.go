@@ -13,16 +13,17 @@ import (
 const MaxEncodedSpecBytes = 4096
 
 type compactSpec struct {
-	InstanceID string            `json:"instance_id"`
-	UserID     string            `json:"user_id"`
-	Image      string            `json:"image"`
-	Cmd        []string          `json:"cmd,omitempty"`
-	Env        []string          `json:"env,omitempty"`
-	Memory     int64             `json:"memory,omitempty"`
-	NanoCPUs   int64             `json:"nano_cpus,omitempty"`
-	Expose     []string          `json:"expose,omitempty"`
-	Labels     map[string]string `json:"labels,omitempty"`
-	SkipPull   bool              `json:"skip_pull,omitempty"`
+	InstanceID       string            `json:"instance_id"`
+	UserID           string            `json:"user_id"`
+	Image            string            `json:"image"`
+	Cmd              []string          `json:"cmd,omitempty"`
+	Env              []string          `json:"env,omitempty"`
+	Memory           int64             `json:"memory,omitempty"`
+	NanoCPUs         int64             `json:"nano_cpus,omitempty"`
+	Expose           []string          `json:"expose,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	SkipPull         bool              `json:"skip_pull,omitempty"`
+	NetworkIsolation NetworkIsolation  `json:"network_isolation,omitempty"`
 }
 
 // EncodeSpec 把规格编码为可写入 Docker label 的 JSON。
@@ -34,16 +35,17 @@ func EncodeSpec(spec Spec) string {
 // EncodeSpecChecked 编码并验证可持久化到 Docker label 的紧凑规格。
 func EncodeSpecChecked(spec Spec) (string, error) {
 	raw, err := json.Marshal(compactSpec{
-		InstanceID: strings.TrimSpace(spec.InstanceID),
-		UserID:     strings.TrimSpace(spec.UserID),
-		Image:      strings.TrimSpace(spec.Image),
-		Cmd:        spec.Cmd,
-		Env:        spec.Env,
-		Memory:     spec.Memory,
-		NanoCPUs:   spec.NanoCPUs,
-		Expose:     spec.Expose,
-		Labels:     userLabels(spec.Labels),
-		SkipPull:   spec.SkipPull,
+		InstanceID:       strings.TrimSpace(spec.InstanceID),
+		UserID:           strings.TrimSpace(spec.UserID),
+		Image:            strings.TrimSpace(spec.Image),
+		Cmd:              spec.Cmd,
+		Env:              spec.Env,
+		Memory:           spec.Memory,
+		NanoCPUs:         spec.NanoCPUs,
+		Expose:           spec.Expose,
+		Labels:           userLabels(spec.Labels),
+		SkipPull:         spec.SkipPull,
+		NetworkIsolation: spec.NetworkIsolation,
 	})
 	if err != nil {
 		return "", sandboxerr.WrapKind("instance.spec", sandboxerr.KindInvalid,
@@ -70,16 +72,17 @@ func DecodeSpec(raw string) (Spec, bool) {
 		return Spec{}, false
 	}
 	return Spec{
-		InstanceID: strings.TrimSpace(c.InstanceID),
-		UserID:     strings.TrimSpace(c.UserID),
-		Image:      strings.TrimSpace(c.Image),
-		Cmd:        c.Cmd,
-		Env:        c.Env,
-		Memory:     c.Memory,
-		NanoCPUs:   c.NanoCPUs,
-		Expose:     c.Expose,
-		Labels:     c.Labels,
-		SkipPull:   c.SkipPull,
+		InstanceID:       strings.TrimSpace(c.InstanceID),
+		UserID:           strings.TrimSpace(c.UserID),
+		Image:            strings.TrimSpace(c.Image),
+		Cmd:              c.Cmd,
+		Env:              c.Env,
+		Memory:           c.Memory,
+		NanoCPUs:         c.NanoCPUs,
+		Expose:           c.Expose,
+		Labels:           c.Labels,
+		SkipPull:         c.SkipPull,
+		NetworkIsolation: c.NetworkIsolation,
 	}, true
 }
 

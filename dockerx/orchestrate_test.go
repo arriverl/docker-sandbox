@@ -153,6 +153,25 @@ func TestNewOrchestratorAppliesConfiguredDefaultLimits(t *testing.T) {
 	}
 }
 
+func TestNewOrchestratorAppliesRecommendedDefaults(t *testing.T) {
+	fake := &fakeEngine{}
+	orch, err := dockerx.NewOrchestrator(dockerx.NewWithAPI(fake), dockerx.UserSandboxConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = orch.Create(context.Background(), sandbox.Spec{
+		InstanceID: "box1",
+		UserID:     "alice",
+		Image:      "alpine:3.20",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.lastHost.Memory != sandbox.RecommendedDefaultMemory || fake.lastHost.NanoCPUs != sandbox.RecommendedDefaultNanoCPUs {
+		t.Fatalf("recommended limits memory=%d nanoCPUs=%d", fake.lastHost.Memory, fake.lastHost.NanoCPUs)
+	}
+}
+
 func TestOrchestrator_WaitReadyExec(t *testing.T) {
 	fake := &fakeEngine{}
 	orch, err := dockerx.NewOrchestrator(dockerx.NewWithAPI(fake), dockerx.UserSandboxConfig{})

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,6 +23,9 @@ func main() {
 	prefix := flag.String("prefix", dockerx.DefaultNetworkPrefix, "name prefix for {prefix}-net-{userId} and {prefix}-ws-{instanceId}")
 	defaultMemory := flag.String("default-memory", "256m", "default instance memory limit")
 	defaultCPUs := flag.String("default-cpus", "0.5", "default instance CPU limit")
+	maxInstances := flag.Int("max-instances", sandbox.DesignPeakInstances, "max active instances; 0 disables the cap")
+	jsonOut := flag.Bool("json", false, "emit JSON instead of human-readable text")
+	journal := flag.String("journal", "", "compensation journal path; empty keeps pending in memory only")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -55,10 +57,14 @@ func main() {
 	}
 
 	mgr := client.Containers()
+	observer := cliObserver{jsonMode: *jsonOut, human: os.Stderr, inner: sandbox.LogObserver{}}
 	sb := dockerx.NewUserSandbox(client, dockerx.UserSandboxConfig{
 		Prefix:          *prefix,
 		DefaultMemory:   defaultMemoryBytes,
 		DefaultNanoCPUs: defaultNanoCPUs,
+		MaxInstances:    *maxInstances,
+		Observer:        observer,
+		JournalPath:     *journal,
 	})
 	orch, err := dockerx.BindOrchestrator(client, sb, *prefix)
 	if err != nil {
@@ -74,13 +80,19 @@ func main() {
 	case "info":
 		out, err = client.Info(ctx)
 	case "ps":
-		out, err = orch.List(ctx)
+		items, listErr := orch.List(ctx)
+		err = listErr
+		out = psResult{Instances: items, PortPool: sb.PortPoolStats()}
 	case "containers":
 		out, err = mgr.List(ctx)
 	case "images":
 		out, err = client.ListImages(ctx)
 	case "create":
 		out, err = runCreate(ctx, mgr, sb, orch, flag.Args()[1:])
+	case "legacy-create":
+		out, err = runLegacyCreate(ctx, mgr, sb, flag.Args()[1:])
+	case "ensure":
+		out, err = runEnsure(ctx, orch, flag.Args()[1:])
 	case "start":
 		out, err = runStart(ctx, orch, flag.Args()[1:])
 	case "stop":
@@ -129,55 +141,110 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(out); err != nil {
+	if err := writeOutput(*jsonOut, out); err != nil {
 		fatal(err)
 	}
 }
 
 func runCreate(ctx context.Context, mgr *dockerx.ContainerManager, sb *dockerx.UserSandbox, orch *sandbox.Service, args []string) (any, error) {
-	fs := flag.NewFlagSet("create", flag.ContinueOnError)
+	spec, _, err := parseInstanceSpec("create", args)
+	if err != nil {
+		return nil, err
+	}
+	if spec.InstanceID == "" {
+		return nil, rejectCreateWithoutInstance()
+	}
+	return orch.Create(ctx, spec)
+}
+
+func runLegacyCreate(ctx context.Context, mgr *dockerx.ContainerManager, sb *dockerx.UserSandbox, args []string) (any, error) {
+	return runRawCreate(ctx, mgr, sb, args)
+}
+
+func runEnsure(ctx context.Context, orch *sandbox.Service, args []string) (any, error) {
+	spec, probe, err := parseInstanceSpec("ensure", args)
+	if err != nil {
+		return nil, err
+	}
+	if spec.InstanceID == "" {
+		return nil, rejectCreateWithoutInstance()
+	}
+	return orch.EnsureRunning(ctx, spec, probe)
+}
+
+func parseInstanceSpec(name string, args []string) (sandbox.Spec, sandbox.Probe, error) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	image := fs.String("image", "", "image name (required)")
-	name := fs.String("name", "", "container name (legacy path only)")
 	cmd := fs.String("cmd", "", "command, space-separated")
-	publish := fs.String("publish", "", "comma-separated ports, e.g. 8080:80/tcp")
 	expose := fs.String("expose", "", "container ports allocated from host port pool, e.g. 80,443/tcp")
 	userID := fs.String("user", "", "user id; required for instance orchestration")
 	instance := fs.String("instance", "", "stable instance id (platform primary key)")
 	memory := fs.String("memory", "", "memory limit, e.g. 64m")
 	cpus := fs.String("cpus", "", "CPU limit, e.g. 0.5")
-	autoRemove := fs.Bool("rm", false, "auto-remove when container exits (legacy path only)")
+	skipPull := fs.Bool("skip-pull", false, "do not pull missing images")
+	netInstance := fs.Bool("net-instance", false, "give this instance its own Docker network")
+	httpPath := fs.String("http", "", "HTTP path on first host port, e.g. /ready")
+	tcp := fs.Bool("tcp", false, "TCP connect to first host port")
+	execCmd := fs.String("exec", "", "command to exec inside the container")
+	port := fs.Int("port", 0, "host port override")
+	if err := fs.Parse(args); err != nil {
+		return sandbox.Spec{}, sandbox.Probe{}, err
+	}
+	spec := sandbox.Spec{
+		InstanceID: *instance,
+		UserID:     *userID,
+		Image:      *image,
+		Expose:     splitCSV(*expose),
+		SkipPull:   *skipPull,
+	}
+	if *netInstance {
+		spec.NetworkIsolation = sandbox.NetworkPerInstance
+	}
+	if *cmd != "" {
+		spec.Cmd = strings.Fields(*cmd)
+	}
+	if *memory != "" {
+		n, err := parseMemory(*memory)
+		if err != nil {
+			return sandbox.Spec{}, sandbox.Probe{}, err
+		}
+		spec.Memory = n
+	}
+	if *cpus != "" {
+		n, err := parseCPUs(*cpus)
+		if err != nil {
+			return sandbox.Spec{}, sandbox.Probe{}, err
+		}
+		spec.NanoCPUs = n
+	}
+	probe := sandbox.Probe{Port: *port}
+	switch {
+	case strings.TrimSpace(*execCmd) != "":
+		probe.Kind = sandbox.ProbeExec
+		probe.Command = strings.Fields(*execCmd)
+	case *tcp:
+		probe.Kind = sandbox.ProbeTCP
+	case strings.TrimSpace(*httpPath) != "":
+		probe.Kind = sandbox.ProbeHTTP
+		probe.Path = *httpPath
+	}
+	return spec, probe, nil
+}
+
+func runRawCreate(ctx context.Context, mgr *dockerx.ContainerManager, sb *dockerx.UserSandbox, args []string) (any, error) {
+	fs := flag.NewFlagSet("legacy-create", flag.ContinueOnError)
+	image := fs.String("image", "", "image name (required)")
+	name := fs.String("name", "", "container name")
+	cmd := fs.String("cmd", "", "command, space-separated")
+	publish := fs.String("publish", "", "comma-separated ports, e.g. 8080:80/tcp")
+	expose := fs.String("expose", "", "container ports allocated from host port pool, e.g. 80,443/tcp")
+	userID := fs.String("user", "", "user id")
+	memory := fs.String("memory", "", "memory limit, e.g. 64m")
+	cpus := fs.String("cpus", "", "CPU limit, e.g. 0.5")
+	autoRemove := fs.Bool("rm", false, "auto-remove when container exits")
 	skipPull := fs.Bool("skip-pull", false, "do not pull missing images")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
-	}
-	if strings.TrimSpace(*instance) != "" {
-		spec := sandbox.Spec{
-			InstanceID: *instance,
-			UserID:     *userID,
-			Image:      *image,
-			Expose:     splitCSV(*expose),
-			SkipPull:   *skipPull,
-		}
-		if *cmd != "" {
-			spec.Cmd = strings.Fields(*cmd)
-		}
-		if *memory != "" {
-			n, err := parseMemory(*memory)
-			if err != nil {
-				return nil, err
-			}
-			spec.Memory = n
-		}
-		if *cpus != "" {
-			n, err := parseCPUs(*cpus)
-			if err != nil {
-				return nil, err
-			}
-			spec.NanoCPUs = n
-		}
-		return orch.Create(ctx, spec)
 	}
 	opts := dockerx.CreateOptions{
 		Image:      *image,
@@ -185,7 +252,6 @@ func runCreate(ctx context.Context, mgr *dockerx.ContainerManager, sb *dockerx.U
 		AutoRemove: *autoRemove,
 		SkipPull:   *skipPull,
 		UserID:     *userID,
-		InstanceID: *instance,
 	}
 	if *cmd != "" {
 		opts.Cmd = strings.Fields(*cmd)
@@ -212,7 +278,7 @@ func runCreate(ctx context.Context, mgr *dockerx.ContainerManager, sb *dockerx.U
 	}
 	if strings.TrimSpace(opts.UserID) != "" || len(opts.Expose) > 0 {
 		if strings.TrimSpace(opts.UserID) == "" {
-			return nil, fmt.Errorf("create -expose requires -user")
+			return nil, fmt.Errorf("legacy-create -expose requires -user")
 		}
 		return sb.Create(ctx, opts)
 	}
@@ -452,33 +518,17 @@ func parseCPUs(s string) (int64, error) {
 }
 
 func usage() {
-	fmt.Fprintf(flag.CommandLine.Output(), `usage: sandboxctl [global flags] <command> [command flags]
-
-instance commands (platform primary key is instance_id):
-  create   -instance ID -user USER -image IMAGE [-memory 64m] [-cpus 0.5] [-expose 80] [-cmd "..."]
-  start    INSTANCE
-  stop     [-t SECONDS] INSTANCE
-  restart  [-t SECONDS] INSTANCE
-  destroy  INSTANCE [-purge]
-  restore  INSTANCE [-reset]
-  inspect  INSTANCE
-  ps
-  wait     INSTANCE [-http PATH] [-tcp] [-exec CMD] [-port N]
-
-legacy container commands:
-  containers | images | ping | version | info
-  create   -image IMAGE [-name NAME] [-user USER] [-cmd "..."] [-publish 8080:80/tcp] [-memory 64m] [-rm] [-skip-pull]
-  remove   [-force] [-volumes] CONTAINER_ID
-  active USER | inactive USER | reap [USER]
-  volume INSTANCE | volumes
-  build    -tag NAME -base IMAGE [-dockerfile PATH] [-env K=V] [-label K=V] [-inject host:dest] [-step "RUN ..."] [-workdir DIR] [-cmd "..."] [-no-cache] [-pull]
-
-`)
+	fmt.Fprint(flag.CommandLine.Output(), usageText())
 	flag.PrintDefaults()
 }
 
 func fatal(err error) {
 	kind := sandboxerr.Classify(err)
-	fmt.Fprintf(os.Stderr, "sandboxctl: [%s] %v\n", kind, err)
+	action := sandboxerr.ActionOf(err)
+	if action != "" {
+		fmt.Fprintf(os.Stderr, "sandboxctl: [%s] next=%s %v\n", kind, action, err)
+	} else {
+		fmt.Fprintf(os.Stderr, "sandboxctl: [%s] %v\n", kind, err)
+	}
 	os.Exit(1)
 }

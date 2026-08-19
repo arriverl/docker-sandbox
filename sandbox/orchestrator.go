@@ -23,9 +23,11 @@ type Service struct {
 	observer        Observer
 	defaultMemory   int64
 	defaultNanoCPUs int64
+	maxInstances    int
 	mutations       keyedLocker
 	users           keyedLocker
 	failed          sync.Map
+	journal         *fileJournal
 }
 
 // New 构造编排器。plugins 五项均不可为空。
@@ -38,11 +40,23 @@ func New(cfg Config, plugins Plugins) (*Service, error) {
 		return nil, sandboxerr.WrapKind("初始化编排器", sandboxerr.KindInvalid,
 			fmt.Errorf("%w: default resource limits must not be negative", sandboxerr.ErrInvalid))
 	}
+	if cfg.MaxInstances < 0 {
+		return nil, sandboxerr.WrapKind("初始化编排器", sandboxerr.KindInvalid,
+			fmt.Errorf("%w: max instances must not be negative", sandboxerr.ErrInvalid))
+	}
 	wait := cfg.WaitInterval
 	if wait <= 0 {
 		wait = 500 * time.Millisecond
 	}
-	return &Service{
+	memory := cfg.DefaultMemory
+	if memory == 0 {
+		memory = RecommendedDefaultMemory
+	}
+	nanoCPUs := cfg.DefaultNanoCPUs
+	if nanoCPUs == 0 {
+		nanoCPUs = RecommendedDefaultNanoCPUs
+	}
+	svc := &Service{
 		prefix:          prefixOrDefault(cfg.Prefix),
 		waitEvery:       wait,
 		runtime:         plugins.Runtime,
@@ -51,9 +65,18 @@ func New(cfg Config, plugins Plugins) (*Service, error) {
 		registry:        plugins.Registry,
 		health:          plugins.Health,
 		observer:        cfg.Observer,
-		defaultMemory:   cfg.DefaultMemory,
-		defaultNanoCPUs: cfg.DefaultNanoCPUs,
-	}, nil
+		defaultMemory:   memory,
+		defaultNanoCPUs: nanoCPUs,
+		maxInstances:    cfg.MaxInstances,
+	}
+	if path := strings.TrimSpace(cfg.JournalPath); path != "" {
+		svc.journal = newFileJournal(path)
+		if err := svc.loadJournal(); err != nil {
+			return nil, sandboxerr.WrapKind("初始化编排器", sandboxerr.KindInvalid,
+				fmt.Errorf("%w: load compensation journal: %v", sandboxerr.ErrInvalid, err))
+		}
+	}
+	return svc, nil
 }
 
 func (s *Service) require() error {
@@ -62,6 +85,97 @@ func (s *Service) require() error {
 			fmt.Errorf("编排沙箱失败：编排器未初始化"))
 	}
 	return nil
+}
+
+func (s *Service) loadJournal() error {
+	if s == nil || s.journal == nil {
+		return nil
+	}
+	entries, err := s.journal.load()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		s.failed.Store(entry.InstanceID, entry)
+	}
+	return nil
+}
+
+func (s *Service) markPending(entry journalEntry) error {
+	if entry.InstanceID == "" {
+		return nil
+	}
+	s.failed.Store(entry.InstanceID, entry)
+	if s.journal != nil {
+		if err := s.journal.put(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) clearPending(instanceID string) {
+	s.failed.Delete(instanceID)
+	if s.journal != nil {
+		_ = s.journal.remove(instanceID)
+	}
+}
+
+func (s *Service) replayPending(ctx context.Context, spec Spec) error {
+	raw, _ := s.failed.Load(spec.InstanceID)
+	entry, _ := raw.(journalEntry)
+	if entry.InstanceID == "" {
+		entry.InstanceID = spec.InstanceID
+		entry.Volume = true
+	}
+	if entry.Volume || entry.InstanceID != "" {
+		if err := s.cleanupFailedCreate(ctx, spec.InstanceID); err != nil {
+			return err
+		}
+	}
+	owner := entry.NetworkOwner
+	if owner == "" {
+		owner = networkOwner(spec)
+	}
+	if entry.Network && owner != "" {
+		if err := s.cleanupCreatedNetwork(ctx, owner); err != nil {
+			return err
+		}
+	}
+	s.clearPending(spec.InstanceID)
+	return nil
+}
+
+func (s *Service) EnsureRunning(ctx context.Context, spec Spec, probe Probe) (result Instance, retErr error) {
+	operationStarted := time.Now()
+	spec = s.applyDefaults(normalizeSpec(spec))
+	s.observe(ctx, "ensure", spec, "operation.start", operationStarted, nil)
+	defer func() {
+		s.observe(ctx, "ensure", spec, "operation.end", operationStarted, retErr)
+	}()
+	inst, err := s.Create(ctx, spec)
+	if err != nil {
+		if sandboxerr.ActionOf(err) == sandboxerr.ActionUseRestore || sandboxerr.ActionOf(err) == sandboxerr.ActionRetryAfter {
+			return Instance{}, err
+		}
+		if !sandboxerr.IsConflict(err) {
+			return Instance{}, err
+		}
+		inst, err = s.Get(ctx, spec.InstanceID)
+		if err != nil {
+			return Instance{}, err
+		}
+	}
+	if inst.Status != StatusRunning {
+		inst, err = s.Start(ctx, inst.ID)
+		if err != nil {
+			return Instance{}, err
+		}
+	}
+	if probe.Kind == "" {
+		return inst, nil
+	}
+	return s.WaitReady(ctx, inst.ID, probe)
 }
 
 func (s *Service) Create(ctx context.Context, spec Spec) (result Instance, retErr error) {
@@ -82,17 +196,16 @@ func (s *Service) Create(ctx context.Context, spec Spec) (result Instance, retEr
 	_, pending := s.failed.Load(spec.InstanceID)
 	if existing, err := s.registry.Get(ctx, spec.InstanceID); err == nil {
 		if existing.Status == StatusDestroyed && pending {
-			if err := s.cleanupFailedCreate(ctx, spec.InstanceID); err != nil {
+			if err := s.replayPending(ctx, spec); err != nil {
 				return Instance{}, orchError("清理失败创建", err, spec.InstanceID, spec.UserID, spec.Image, existing.Status)
 			}
-			s.failed.Delete(spec.InstanceID)
 		} else if existing.Status == StatusDestroyed {
 			return Instance{}, orchError("创建实例",
-				sandboxerr.WrapKind("instance.create", sandboxerr.KindConflict,
+				sandboxerr.WrapKindAction("instance.create", sandboxerr.KindConflict, sandboxerr.ActionUseRestore,
 					fmt.Errorf("%w: instance was destroyed; use restore", sandboxerr.ErrConflict)),
 				spec.InstanceID, spec.UserID, spec.Image, existing.Status)
 		} else {
-			s.failed.Delete(spec.InstanceID)
+			s.clearPending(spec.InstanceID)
 			return Instance{}, orchError("创建实例",
 				sandboxerr.WrapKind("instance.create", sandboxerr.KindConflict,
 					fmt.Errorf("%w: instance already exists", sandboxerr.ErrConflict)),
@@ -101,12 +214,37 @@ func (s *Service) Create(ctx context.Context, spec Spec) (result Instance, retEr
 	} else if err != nil && !sandboxerr.IsNotFound(err) {
 		return Instance{}, orchError("创建实例", err, spec.InstanceID, spec.UserID, spec.Image, "")
 	} else if pending {
-		if err := s.cleanupFailedCreate(ctx, spec.InstanceID); err != nil {
+		if err := s.replayPending(ctx, spec); err != nil {
 			return Instance{}, orchError("清理失败创建", err, spec.InstanceID, spec.UserID, spec.Image, "")
 		}
-		s.failed.Delete(spec.InstanceID)
+	}
+	if err := s.enforceMaxInstances(ctx, spec); err != nil {
+		return Instance{}, err
 	}
 	return s.provision(ctx, spec)
+}
+
+func (s *Service) enforceMaxInstances(ctx context.Context, spec Spec) error {
+	if s.maxInstances <= 0 {
+		return nil
+	}
+	items, err := s.registry.List(ctx)
+	if err != nil {
+		return orchError("创建实例", err, spec.InstanceID, spec.UserID, spec.Image, "")
+	}
+	active := 0
+	for _, inst := range items {
+		if inst.Status != StatusDestroyed {
+			active++
+		}
+	}
+	if active >= s.maxInstances {
+		return orchError("创建实例",
+			sandboxerr.WrapKindAction("instance.create", sandboxerr.KindConflict, sandboxerr.ActionRetryAfter,
+				fmt.Errorf("%w: active instance count %d reached max %d", sandboxerr.ErrConflict, active, s.maxInstances)),
+			spec.InstanceID, spec.UserID, spec.Image, "")
+	}
+	return nil
 }
 
 func (s *Service) provision(ctx context.Context, spec Spec) (Instance, error) {
@@ -120,8 +258,9 @@ func (s *Service) provisionFor(ctx context.Context, spec Spec, operation string)
 	}
 	unlockUser := s.users.lock(spec.UserID)
 	defer unlockUser()
+	owner := networkOwner(spec)
 	started := time.Now()
-	netName, networkCreated, err := s.ensureNetwork(ctx, spec.UserID)
+	netName, networkCreated, err := s.ensureNetwork(ctx, owner)
 	s.observe(ctx, operation, spec, "provision.network", started, err)
 	if err != nil {
 		return Instance{}, orchError("创建用户网络", err, spec.InstanceID, spec.UserID, spec.Image, "")
@@ -133,10 +272,13 @@ func (s *Service) provisionFor(ctx context.Context, spec Spec, operation string)
 	if err != nil {
 		if networkCreated {
 			cleanupStarted := time.Now()
-			cleanupErr := s.cleanupCreatedNetwork(ctx, spec.UserID)
+			cleanupErr := s.cleanupCreatedNetwork(ctx, owner)
 			s.observe(ctx, operation, spec, "compensation.network", cleanupStarted, cleanupErr)
 			if cleanupErr != nil {
 				err = errors.Join(err, fmt.Errorf("回滚用户网络失败: %w", cleanupErr))
+				if jerr := s.markPending(journalEntry{InstanceID: spec.InstanceID, UserID: spec.UserID, NetworkOwner: owner, Network: true}); jerr != nil {
+					err = errors.Join(err, fmt.Errorf("写入补偿日志失败: %w", jerr))
+				}
 			}
 		}
 		return Instance{}, orchError("创建工作区卷", err, spec.InstanceID, spec.UserID, spec.Image, "")
@@ -159,21 +301,28 @@ func (s *Service) provisionFor(ctx context.Context, spec Spec, operation string)
 	})
 	s.observe(ctx, operation, spec, "provision.runtime", started, err)
 	if err != nil {
+		pending := journalEntry{InstanceID: spec.InstanceID, UserID: spec.UserID, NetworkOwner: owner}
 		if created {
 			cleanupStarted := time.Now()
 			cleanupErr := s.cleanupFailedCreate(ctx, spec.InstanceID)
 			s.observe(ctx, operation, spec, "compensation.storage", cleanupStarted, cleanupErr)
 			if cleanupErr != nil {
-				s.failed.Store(spec.InstanceID, struct{}{})
+				pending.Volume = true
 				err = errors.Join(err, fmt.Errorf("回滚工作区卷失败: %w", cleanupErr))
 			}
 		}
 		if networkCreated {
 			cleanupStarted := time.Now()
-			cleanupErr := s.cleanupCreatedNetwork(ctx, spec.UserID)
+			cleanupErr := s.cleanupCreatedNetwork(ctx, owner)
 			s.observe(ctx, operation, spec, "compensation.network", cleanupStarted, cleanupErr)
 			if cleanupErr != nil {
+				pending.Network = true
 				err = errors.Join(err, fmt.Errorf("回滚用户网络失败: %w", cleanupErr))
+			}
+		}
+		if pending.Volume || pending.Network {
+			if jerr := s.markPending(pending); jerr != nil {
+				err = errors.Join(err, fmt.Errorf("写入补偿日志失败: %w", jerr))
 			}
 		}
 		return Instance{}, orchError("创建实例", err, spec.InstanceID, spec.UserID, spec.Image, "")
@@ -214,10 +363,7 @@ func (s *Service) applyDefaults(spec Spec) Spec {
 }
 
 func (s *Service) observe(ctx context.Context, operation string, spec Spec, stage string, started time.Time, err error) {
-	if s == nil || s.observer == nil {
-		return
-	}
-	event := OperationEvent{
+	s.emit(ctx, OperationEvent{
 		Operation:  operation,
 		Stage:      stage,
 		InstanceID: spec.InstanceID,
@@ -225,6 +371,12 @@ func (s *Service) observe(ctx context.Context, operation string, spec Spec, stag
 		Duration:   time.Since(started),
 		Kind:       sandboxerr.Classify(err),
 		Err:        err,
+	})
+}
+
+func (s *Service) emit(ctx context.Context, event OperationEvent) {
+	if s == nil || s.observer == nil {
+		return
 	}
 	func() {
 		defer func() { _ = recover() }()
@@ -335,15 +487,19 @@ func (s *Service) Destroy(ctx context.Context, instanceID string, opts DestroyOp
 	if storageErr := s.storage.Destroy(cleanupCtx, instanceID, opts.Purge); storageErr != nil && !sandboxerr.IsNotFound(storageErr) {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("清理工作区卷: %w", storageErr))
 	}
-	if inst.UserID != "" {
-		if networkErr := s.network.Release(cleanupCtx, inst.UserID); networkErr != nil && !sandboxerr.IsNotFound(networkErr) {
+	if inst.UserID != "" || inst.Spec.InstanceID != "" {
+		owner := networkOwner(inst.Spec)
+		if owner == "" {
+			owner = inst.UserID
+		}
+		if networkErr := s.network.Release(cleanupCtx, owner); networkErr != nil && !sandboxerr.IsNotFound(networkErr) {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("释放用户网络: %w", networkErr))
 		}
 	}
 	if len(cleanupErrs) > 0 {
 		return orchError("销毁实例", errors.Join(cleanupErrs...), instanceID, inst.UserID, inst.Image, inst.Status)
 	}
-	s.failed.Delete(instanceID)
+	s.clearPending(instanceID)
 	return nil
 }
 
@@ -392,7 +548,7 @@ func (s *Service) Restore(ctx context.Context, instanceID string, opts RestoreOp
 		cleanupErrs = append(cleanupErrs, err)
 		return Instance{}, orchError("还原实例", errors.Join(cleanupErrs...), instanceID, spec.UserID, spec.Image, inst.Status)
 	}
-	s.failed.Delete(instanceID)
+	s.clearPending(instanceID)
 	if len(cleanupErrs) > 0 {
 		return restored, orchError("还原实例", errors.Join(cleanupErrs...), instanceID, spec.UserID, spec.Image, inst.Status)
 	}
@@ -440,12 +596,30 @@ func (s *Service) WaitReady(ctx context.Context, instanceID string, probe Probe)
 	if err := ValidateProbe(inst, probe); err != nil {
 		return Instance{}, orchError("等待实例就绪", err, inst.ID, inst.UserID, inst.Image, inst.Status)
 	}
+	waitStarted := time.Now()
+	attempt := 0
+	emitRetry := func(checkErr error) {
+		attempt++
+		s.emit(ctx, OperationEvent{
+			Operation:  "wait",
+			Stage:      "wait.retry",
+			InstanceID: inst.ID,
+			UserID:     inst.UserID,
+			Duration:   time.Since(waitStarted),
+			Kind:       sandboxerr.Classify(checkErr),
+			Err:        checkErr,
+			Attempt:    attempt,
+			Detail:     checkErr.Error(),
+		})
+	}
 	ticker := time.NewTicker(s.waitEvery)
 	defer ticker.Stop()
 	if err := s.health.Check(ctx, inst, probe); err == nil {
 		return inst, nil
 	} else if isPermanentProbeError(err) {
 		return Instance{}, orchError("等待实例就绪", err, inst.ID, inst.UserID, inst.Image, inst.Status)
+	} else {
+		emitRetry(err)
 	}
 	for {
 		select {
@@ -468,10 +642,13 @@ func (s *Service) WaitReady(ctx context.Context, instanceID string, probe Probe)
 						fmt.Errorf("%w: instance is not running", sandboxerr.ErrInvalid)),
 					cur.ID, cur.UserID, cur.Image, cur.Status)
 			}
+			inst = cur
 			if err := s.health.Check(ctx, cur, probe); err == nil {
 				return cur, nil
 			} else if isPermanentProbeError(err) {
 				return Instance{}, orchError("等待实例就绪", err, cur.ID, cur.UserID, cur.Image, cur.Status)
+			} else {
+				emitRetry(err)
 			}
 		}
 	}

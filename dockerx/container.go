@@ -127,7 +127,7 @@ func (c *Client) pullImage(ctx context.Context, ref string) error {
 		return wrapEngine("image.pull", err)
 	}
 	defer rc.Close()
-	if err := parsePullStream(rc); err != nil {
+	if err := parsePullStream(rc, c.onPullProgress); err != nil {
 		return err
 	}
 	_, _, err = c.api.ImageInspectWithRaw(ctx, ref)
@@ -142,13 +142,19 @@ func (c *Client) pullImage(ctx context.Context, ref string) error {
 }
 
 type pullStreamMsg struct {
+	Status      string `json:"status"`
+	ID          string `json:"id"`
 	Error       string `json:"error"`
 	ErrorDetail struct {
 		Message string `json:"message"`
 	} `json:"errorDetail"`
+	ProgressDetail struct {
+		Current int64 `json:"current"`
+		Total   int64 `json:"total"`
+	} `json:"progressDetail"`
 }
 
-func parsePullStream(r io.Reader) error {
+func parsePullStream(r io.Reader, progress func(PullProgress)) error {
 	dec := json.NewDecoder(r)
 	for {
 		var msg pullStreamMsg
@@ -164,6 +170,14 @@ func parsePullStream(r io.Reader) error {
 			fail = strings.TrimSpace(msg.ErrorDetail.Message)
 		}
 		if fail == "" {
+			if progress != nil && (msg.Status != "" || msg.ID != "") {
+				progress(PullProgress{
+					ID:      msg.ID,
+					Status:  msg.Status,
+					Current: msg.ProgressDetail.Current,
+					Total:   msg.ProgressDetail.Total,
+				})
+			}
 			continue
 		}
 		kind := sandboxerr.KindInvalid
