@@ -141,6 +141,28 @@ func TestClient_PingUnreachableDaemonIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestConfig_HTTPClientDoesNotForceHTTP2(t *testing.T) {
+	cfg := dockerx.Config{
+		Host:         "unix:///var/run/docker.sock",
+		DisableProxy: true,
+		Timeout:      5 * time.Second,
+	}
+	hc, err := cfg.HTTPClient()
+	if err != nil {
+		t.Fatalf("HTTPClient: %v", err)
+	}
+	tr, ok := hc.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type %T, want *http.Transport", hc.Transport)
+	}
+	if tr.ForceAttemptHTTP2 {
+		t.Fatal("ForceAttemptHTTP2 must stay false so WithHost can use HTTP/1.1 on unix/npipe")
+	}
+	if tr.DialContext != nil {
+		t.Fatal("DialContext must be unset so client.WithHost can install the unix/npipe dialer")
+	}
+}
+
 func TestConfig_HTTPClientUsesProxy(t *testing.T) {
 	cfg := dockerx.Config{
 		Host:     "tcp://127.0.0.1:2375",
@@ -264,8 +286,8 @@ func (f *fakeEngine) ImageList(_ context.Context, opts image.ListOptions) ([]ima
 
 func (f *fakeEngine) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.ops = append(f.ops, "create")
-	f.mu.Unlock()
 	f.lastName = name
 	f.lastConfig = config
 	f.lastHost = hostConfig

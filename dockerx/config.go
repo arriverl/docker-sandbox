@@ -2,7 +2,6 @@ package dockerx
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -116,20 +115,19 @@ func (c Config) HTTPClient() (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 不要设 DialContext / ForceAttemptHTTP2。
+	// New() 随后会 WithHost → sockets.ConfigureTransport，按 unix/npipe/tcp 改写拨号。
+	// 若这里强制 HTTP/2，ConfigureTransport 不会清掉该标志，Linux 上连 docker.sock 会直接失败。
 	transport := &http.Transport{
-		Proxy: proxyFn,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		Proxy:                 proxyFn,
+		MaxIdleConns:          6,
+		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	return &http.Client{
-		Transport: transport,
-		Timeout:   c.timeout(),
+		Transport:     transport,
+		Timeout:       c.timeout(),
+		CheckRedirect: client.CheckRedirect,
 	}, nil
 }

@@ -17,11 +17,17 @@ jobs:
       GOTOOLCHAIN: local
       DOCKER_SANDBOX_LIVE: "0"
     steps:
+      - name: Use LF checkouts
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.24.2"
           cache: true
@@ -32,8 +38,7 @@ jobs:
       - name: Check formatting
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Recurse -Filter *.go | ForEach-Object { $_.FullName }
-          $unformatted = gofmt -l $files
+          $unformatted = gofmt -l .
           if ($unformatted) {
             $unformatted
             throw "Go files are not formatted"
@@ -58,7 +63,7 @@ jobs:
 
   race:
     name: Race detector
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       GOTOOLCHAIN: local
@@ -66,10 +71,10 @@ jobs:
       CGO_ENABLED: "1"
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.24.2"
           cache: true

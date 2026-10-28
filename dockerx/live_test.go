@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +19,7 @@ func TestClient_LiveDaemonSkipIfUnavailable(t *testing.T) {
 	}
 	c, err := dockerx.New(dockerx.Config{Timeout: 5 * time.Second, DisableProxy: true})
 	if err != nil {
-		if sandboxerr.IsInvalid(err) || sandboxerr.IsUnavailable(err) {
+		if sandboxerr.IsUnavailable(err) {
 			t.Skipf("cannot construct client: %v", err)
 		}
 		t.Fatalf("New: %v", err)
@@ -38,13 +39,20 @@ func TestOrchestrator_LiveCreateDestroy(t *testing.T) {
 	if os.Getenv("DOCKER_SANDBOX_LIVE") != "1" {
 		t.Skip("set DOCKER_SANDBOX_LIVE=1 to run live create/destroy smoke")
 	}
+	prefix := "smoketest"
+	if runID := strings.TrimSpace(os.Getenv("GITHUB_RUN_ID")); runID != "" {
+		prefix = "smoketest-" + runID
+	}
 	c, err := dockerx.New(dockerx.Config{Timeout: 2 * time.Minute, DisableProxy: true})
 	if err != nil {
+		if sandboxerr.IsUnavailable(err) {
+			t.Skipf("cannot construct client: %v", err)
+		}
 		t.Fatalf("New: %v", err)
 	}
 	defer c.Close()
 	orch, err := dockerx.NewOrchestrator(c, dockerx.UserSandboxConfig{
-		Prefix:       "smoketest",
+		Prefix:       prefix,
 		MaxInstances: 2,
 		Observer:     sandbox.LogObserver{},
 	})
@@ -54,12 +62,14 @@ func TestOrchestrator_LiveCreateDestroy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	id := fmt.Sprintf("smoke-%d", time.Now().UnixNano())
+	// CI 工作流先 docker pull，避免 Create 再拉一次撞 Docker Hub 限额。
+	skipPull := os.Getenv("CI") == "true" || os.Getenv("GITHUB_ACTIONS") == "true"
 	created, err := orch.Create(ctx, sandbox.Spec{
 		InstanceID: id,
 		UserID:     "smoke",
 		Image:      "alpine:3.20",
 		Cmd:        []string{"sleep", "30"},
-		SkipPull:   false,
+		SkipPull:   skipPull,
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)

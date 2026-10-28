@@ -11,20 +11,36 @@ permissions:
 jobs:
   smoke:
     name: Ubuntu live create/destroy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       GOTOOLCHAIN: local
       DOCKER_SANDBOX_LIVE: "1"
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.24.2"
           cache: true
 
+      - name: Verify Docker daemon
+        run: |
+          docker version
+          docker info
+
+      - name: Pre-pull smoke image
+        run: |
+          set -euo pipefail
+          pull() { docker pull "$1" && docker tag "$1" alpine:3.20; }
+          if pull alpine:3.20; then
+            exit 0
+          fi
+          echo "docker hub pull failed, falling back to public.ecr.aws"
+          pull public.ecr.aws/docker/library/alpine:3.20
+          docker image inspect alpine:3.20
+
       - name: Live smoke tests
-        run: go test -mod=mod ./dockerx/ -run 'TestClient_LiveDaemonSkipIfUnavailable|TestOrchestrator_LiveCreateDestroy' -count=1 -timeout=10m
+        run: go test -mod=mod ./dockerx/ -run 'TestClient_LiveDaemonSkipIfUnavailable|TestOrchestrator_LiveCreateDestroy' -count=1 -timeout=10m -v
